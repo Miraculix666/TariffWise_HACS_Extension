@@ -1,0 +1,73 @@
+"""Calculator for 24-hour sliding window statistics."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from custom_components.tibber_prices.const import get_display_precision
+from custom_components.tibber_prices.entity_utils import get_price_value
+
+from .base import TibberPricesBaseCalculator
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+
+class TibberPricesWindow24hCalculator(TibberPricesBaseCalculator):
+    """
+    Calculator for 24-hour sliding window statistics.
+
+    Handles sensors that calculate statistics over a 24-hour window relative to
+    the current interval (trailing = previous 24h, leading = next 24h).
+    """
+
+    def get_24h_window_value(
+        self,
+        *,
+        stat_func: Callable,
+    ) -> float | tuple[float, float | None] | None:
+        """
+        Unified method for 24-hour sliding window statistics.
+
+        Calculates statistics over a 24-hour window relative to the current interval:
+        - "trailing": Previous 24 hours (96 intervals before current)
+        - "leading": Next 24 hours (96 intervals after current)
+
+        Args:
+            stat_func: Function from average_utils (e.g., calculate_current_trailing_mean).
+
+        Returns:
+            Price value in subunit currency units (cents/øre), or None if unavailable.
+            For mean functions: tuple of (mean, median) where median may be None.
+            For min/max functions: single float value.
+
+        """
+        if not self.has_data():
+            return None
+
+        result = stat_func(self.coordinator_data, time=self.coordinator.time)
+
+        # Check if result is a tuple (mean, median) from mean functions
+        if isinstance(result, tuple):
+            value, median = result
+            if value is None:
+                return None
+            # Convert to display currency units based on config
+            precision = get_display_precision(self.coordinator.config_entry)
+            mean_result = round(get_price_value(value, config_entry=self.coordinator.config_entry), precision)
+            median_result = (
+                round(get_price_value(median, config_entry=self.coordinator.config_entry), precision)
+                if median is not None
+                else None
+            )
+            return mean_result, median_result
+
+        # Single value result (min/max functions)
+        value = result
+        if value is None:
+            return None
+
+        # Return in configured display currency units
+        precision = get_display_precision(self.coordinator.config_entry)
+        result = get_price_value(value, config_entry=self.coordinator.config_entry)
+        return round(result, precision)

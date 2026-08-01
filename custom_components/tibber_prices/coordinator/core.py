@@ -1,0 +1,944 @@
+"""Enhanced coordinator for fetching Tibber price data with comprehensive caching."""
+
+from __future__ import annotations
+
+from datetime import timedelta
+import logging
+from typing import TYPE_CHECKING, Any
+
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.helpers.storage import Store
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+
+if TYPE_CHECKING:
+    from datetime import date, datetime
+
+    from homeassistant.config_entries import ConfigEntry
+
+    from .listeners import TimeServiceCallback
+
+from custom_components.tibber_prices.api import (
+    TibberPricesApiClient,
+    TibberPricesApiClientAuthenticationError,
+    TibberPricesApiClientCommunicationError,
+    TibberPricesApiClientError,
+)
+from custom_components.tibber_prices.const import DOMAIN
+from custom_components.tibber_prices.utils.price import find_price_data_for_interval
+from homeassistant.exceptions import ConfigEntryAuthFailed
+
+from . import helpers
+from .constants import STORAGE_VERSION, UPDATE_INTERVAL
+from .data_transformation import TibberPricesDataTransformer
+from .listeners import TibberPricesListenerManager
+from .midnight_handler import TibberPricesMidnightHandler
+from .periods import TibberPricesPeriodCalculator
+from .price_data_manager import TibberPricesPriceDataManager
+from .repairs import TibberPricesRepairManager
+from .time_service import TibberPricesTimeService
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def get_connection_state(coordinator: TibberPricesDataUpdateCoordinator) -> bool | None:
+    """
+    Determine API connection state based on lifecycle and exceptions.
+
+    This is the source of truth for the connection binary sensor.
+    It ensures consistency between lifecycle_status and connection state.
+
+    Returns:
+        True: Connected and working (cached or fresh data)
+        False: Connection failed or auth failed
+        None: Unknown state (no data yet, initializing)
+
+    Logic:
+        - Auth failures → definitively disconnected (False)
+        - Other errors with cached data → considered connected (True, using cache)
+        - No errors with data → connected (True)
+        - No data and no error → initializing (None)
+
+    """
+    # Auth failures = definitively disconnected
+    # User must provide new token via reauth flow
+    if isinstance(coordinator.last_exception, ConfigEntryAuthFailed):
+        return False
+
+    # Other errors but cache available = considered connected (using cached data as fallback)
+    # This shows "on" but lifecycle_status will show "error" to indicate degraded operation
+    if coordinator.last_exception and coordinator.data:
+        return True
+
+    # No error and data available = connected
+    if coordinator.data:
+        return True
+
+    # No data and no error = initializing (unknown state)
+    return None
+
+
+# =============================================================================
+# TIMER SYSTEM - Three independent update mechanisms:
+# =============================================================================
+#
+# Timer #1: DataUpdateCoordinator (HA's built-in, every UPDATE_INTERVAL)
+#   - Purpose: Check if API data needs updating, fetch if necessary
+#   - Trigger: _async_update_data()
+#   - What it does:
+#     * Checks for midnight turnover FIRST (prevents race condition with Timer #2)
+#     * If turnover needed: Rotates data, saves cache, notifies entities, returns
+#     * Checks _should_update_price_data() (tomorrow missing? interval passed?)
+#     * Fetches fresh data from API if needed
+#     * Uses cached data otherwise (fast path)
+#     * Transforms data only when needed (config change, new data, midnight)
+#   - Load distribution:
+#     * Start time varies per installation → natural distribution
+#     * Tomorrow data check adds 0-30s random delay → prevents thundering herd
+#   - Midnight coordination:
+#     * Atomic check using _check_midnight_turnover_needed(now)
+#     * If turnover needed, performs it and returns early
+#     * Timer #2 will see turnover already done and skip
+#
+# Timer #2: Quarter-Hour Refresh (exact :00, :15, :30, :45 boundaries)
+#   - Purpose: Update time-sensitive entity states at interval boundaries
+#   - Trigger: _handle_quarter_hour_refresh()
+#   - What it does:
+#     * Checks for midnight turnover (atomic check, coordinates with Timer #1)
+#     * If Timer #1 already did turnover → skip gracefully
+#     * If turnover needed → performs it, saves cache, notifies all entities
+#     * Otherwise → only notifies time-sensitive entities (fast path)
+#   - Midnight coordination:
+#     * Uses same atomic check as Timer #1
+#     * Whoever runs first does turnover, the other skips
+#     * No race condition possible (date comparison is atomic)
+#
+# Timer #3: Minute Refresh (every minute)
+#   - Purpose: Update countdown/progress sensors
+#   - Trigger: _handle_minute_refresh()
+#   - What it does:
+#     * Notifies minute-update entities (remaining_minutes, progress)
+#     * Does NOT fetch data or transform - uses existing cache
+#     * No midnight handling (not relevant for timing sensors)
+#
+# Midnight Turnover Coordination:
+#   - Both Timer #1 and Timer #2 check for midnight turnover
+#   - Atomic check: _check_midnight_turnover_needed(now)
+#     Returns True if current_date > _last_midnight_turnover_check.date()
+#     Returns False if already done today
+#   - Whoever runs first (Timer #1 or Timer #2) performs turnover:
+#     Calls _perform_midnight_data_rotation(now)
+#     Updates _last_midnight_turnover_check and _last_actual_turnover to current time
+#   - The other timer sees turnover already done and skips
+#   - No locks needed - date comparison is naturally atomic
+#   - No race condition possible - Python datetime.date() comparison is thread-safe
+#   - _last_transformation_time is separate and tracks when data was last transformed (for cache)
+#
+#   CRITICAL - Dual Listener System:
+#   After midnight turnover, BOTH listener groups must be notified:
+#   1. Normal listeners (async_update_listeners) - standard HA entities
+#   2. Time-sensitive listeners (_async_update_time_sensitive_listeners) - quarter-hour entities
+#
+#   Why? Entities like best_price_period and peak_price_period register as time-sensitive
+#   listeners and won't update if only async_update_listeners() is called. This caused
+#   the bug where period binary sensors showed stale data until the next quarter-hour
+#   refresh at 00:15 (they were updated then because Timer #2 explicitly calls
+#   _async_update_time_sensitive_listeners in its normal flow).
+#
+# =============================================================================
+
+
+class TibberPricesDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
+    """Enhanced coordinator with main/subentry pattern and comprehensive caching."""
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        config_entry: ConfigEntry,
+        api_client: TibberPricesApiClient,
+        interval_pool: Any,  # TibberPricesIntervalPool - Any to avoid circular import
+    ) -> None:
+        """Initialize the coordinator."""
+        super().__init__(
+            hass,
+            _LOGGER,
+            name=DOMAIN,
+            update_interval=UPDATE_INTERVAL,
+        )
+
+        self.config_entry = config_entry
+
+        # Get home_id from config entry
+        self._home_id = config_entry.data.get("home_id", "")
+        if not self._home_id:
+            _LOGGER.error("No home_id found in config entry %s", config_entry.entry_id)
+
+        # Use the API client from runtime_data (created in __init__.py with proper TOKEN handling)
+        self.api = api_client
+
+        # Use the shared interval pool (one per config entry/Tibber account)
+        self.interval_pool = interval_pool
+
+        # Storage for persistence
+        storage_key = f"{DOMAIN}.{config_entry.entry_id}"
+        self._store = Store(hass, STORAGE_VERSION, storage_key)
+
+        # Log prefix for identifying this coordinator instance
+        self._log_prefix = f"[{config_entry.title}]"
+
+        # Note: In the new architecture, all coordinators (parent + subentries) fetch their own data
+        # No distinction between "main" and "sub" coordinators anymore
+
+        # Initialize time service (single source of truth for all time operations)
+        self.time = TibberPricesTimeService()
+
+        # Set time on API client (needed for rate limiting)
+        self.api.time = self.time
+
+        # Initialize helper modules
+        self._listener_manager = TibberPricesListenerManager(hass, self._log_prefix)
+        self._midnight_handler = TibberPricesMidnightHandler()
+        self._price_data_manager = TibberPricesPriceDataManager(
+            api=self.api,
+            store=self._store,
+            log_prefix=self._log_prefix,
+            user_update_interval=timedelta(days=1),
+            time=self.time,
+            home_id=self._home_id,
+            interval_pool=self.interval_pool,
+        )
+        # Create period calculator BEFORE data transformer (transformer needs it in lambda)
+        self._period_calculator = TibberPricesPeriodCalculator(
+            config_entry=config_entry,
+            log_prefix=self._log_prefix,
+            get_config_override_fn=self.get_config_override,
+        )
+        self._data_transformer = TibberPricesDataTransformer(
+            config_entry=config_entry,
+            log_prefix=self._log_prefix,
+            calculate_periods_fn=self._period_calculator.calculate_periods_for_price_info,
+            time=self.time,
+        )
+        self._repair_manager = TibberPricesRepairManager(
+            hass=hass,
+            entry_id=config_entry.entry_id,
+            home_name=config_entry.title,
+        )
+
+        # Register options update listener to invalidate config caches
+        config_entry.async_on_unload(config_entry.add_update_listener(self._handle_options_update))
+
+        # User data cache (price data is in IntervalPool)
+        self._cached_user_data: dict[str, Any] | None = None
+        self._last_user_update: datetime | None = None
+        self._user_update_interval = timedelta(days=1)
+
+        # Data lifecycle tracking
+        # Note: _lifecycle_state is used for DIAGNOSTICS only (diagnostics.py export).
+        # The lifecycle SENSOR calculates its state dynamically in get_lifecycle_state(),
+        # using: _is_fetching, last_exception, time calculations, _needs_tomorrow_data(),
+        # and _last_price_update. It does NOT read _lifecycle_state!
+        self._lifecycle_state: str = (
+            "cached"  # For diagnostics: cached, fresh, refreshing, searching_tomorrow, turnover_pending, error
+        )
+        self._last_price_update: datetime | None = None  # When price data was last fetched from API
+        self._api_calls_today: int = 0  # Counter for API calls today
+        self._last_api_call_date: date | None = None  # Date of last API call (for daily reset)
+        self._is_fetching: bool = False  # Flag to track active API fetch (read by lifecycle sensor)
+        self._last_coordinator_update: datetime | None = None  # When Timer #1 last ran (_async_update_data)
+
+        # Runtime config overrides from config entities (number/switch)
+        # Structure: {"section_name": {"config_key": value, ...}, ...}
+        # When set, these override the corresponding options from config_entry.options
+        self._config_overrides: dict[str, dict[str, Any]] = {}
+
+        # Start timers
+        self._listener_manager.schedule_quarter_hour_refresh(self._handle_quarter_hour_refresh)
+        self._listener_manager.schedule_minute_refresh(self._handle_minute_refresh)
+
+    def _log(self, level: str, message: str, *args: Any, **kwargs: Any) -> None:
+        """Log with coordinator-specific prefix."""
+        prefixed_message = f"{self._log_prefix} {message}"
+        getattr(_LOGGER, level)(prefixed_message, *args, **kwargs)
+
+    async def _handle_options_update(self, _hass: HomeAssistant, _config_entry: ConfigEntry) -> None:
+        """Handle options update by invalidating config caches and re-transforming data."""
+        self._log("debug", "Options update triggered, re-transforming data")
+        self._data_transformer.invalidate_config_cache()
+        self._period_calculator.invalidate_config_cache()
+
+        # Re-transform existing data with new configuration
+        # This updates rating_levels, volatility, and period calculations
+        # without needing to fetch new data from the API
+        if self.data and "priceInfo" in self.data:
+            # Extract raw price_info and re-transform.
+            # CRITICAL: Preserve currency and home_id so non-EUR users don't see
+            # wrong units (e.g. EUR instead of NOK/SEK) until the next API poll.
+            raw_data = {
+                "price_info": self.data["priceInfo"],
+                "currency": self.data.get("currency", "EUR"),
+                "home_id": self._home_id,
+            }
+            self.data = self._transform_data(raw_data)
+            self.async_update_listeners()
+        else:
+            self._log("debug", "No data to re-transform")
+
+    # =========================================================================
+    # Runtime Config Override Methods (for number/switch entities)
+    # =========================================================================
+
+    def set_config_override(self, config_key: str, config_section: str, value: Any) -> None:
+        """
+        Set a runtime config override value.
+
+        These overrides take precedence over options from config_entry.options
+        and are used by number/switch entities for runtime configuration.
+
+        Args:
+            config_key: The configuration key (e.g., CONF_BEST_PRICE_FLEX)
+            config_section: The section in options (e.g., "flexibility_settings")
+            value: The override value
+
+        """
+        if config_section not in self._config_overrides:
+            self._config_overrides[config_section] = {}
+        self._config_overrides[config_section][config_key] = value
+        self._log(
+            "debug",
+            "Config override set: %s.%s = %s",
+            config_section,
+            config_key,
+            value,
+        )
+
+    def remove_config_override(self, config_key: str, config_section: str) -> None:
+        """
+        Remove a runtime config override value.
+
+        After removal, the value from config_entry.options will be used again.
+
+        Args:
+            config_key: The configuration key to remove
+            config_section: The section the key belongs to
+
+        """
+        if config_section in self._config_overrides:
+            self._config_overrides[config_section].pop(config_key, None)
+            # Clean up empty sections
+            if not self._config_overrides[config_section]:
+                del self._config_overrides[config_section]
+        self._log(
+            "debug",
+            "Config override removed: %s.%s",
+            config_section,
+            config_key,
+        )
+
+    def get_config_override(self, config_key: str, config_section: str) -> Any | None:
+        """
+        Get a runtime config override value if set.
+
+        Args:
+            config_key: The configuration key to check
+            config_section: The section the key belongs to
+
+        Returns:
+            The override value if set, None otherwise
+
+        """
+        return self._config_overrides.get(config_section, {}).get(config_key)
+
+    def has_config_override(self, config_key: str, config_section: str) -> bool:
+        """
+        Check if a runtime config override is set.
+
+        Args:
+            config_key: The configuration key to check
+            config_section: The section the key belongs to
+
+        Returns:
+            True if an override is set, False otherwise
+
+        """
+        return config_key in self._config_overrides.get(config_section, {})
+
+    def get_active_overrides(self) -> dict[str, dict[str, Any]]:
+        """
+        Get all active config overrides.
+
+        Returns:
+            Dictionary of all active overrides by section
+
+        """
+        return self._config_overrides.copy()
+
+    async def async_handle_config_override_update(self) -> None:
+        """
+        Handle config override change by invalidating caches and re-transforming data.
+
+        This is called by number/switch entities when their values change.
+        Uses the same logic as options update to ensure consistent behavior.
+        """
+        self._log("debug", "Config override update triggered, re-transforming data")
+        self._data_transformer.invalidate_config_cache()
+        self._period_calculator.invalidate_config_cache()
+
+        # Re-transform existing data with new configuration.
+        # CRITICAL: Preserve currency and home_id (same fix as _handle_options_update).
+        if self.data and "priceInfo" in self.data:
+            raw_data = {
+                "price_info": self.data["priceInfo"],
+                "currency": self.data.get("currency", "EUR"),
+                "home_id": self._home_id,
+            }
+            self.data = self._transform_data(raw_data)
+            self.async_update_listeners()
+        else:
+            self._log("debug", "No data to re-transform")
+
+    @callback
+    def async_add_time_sensitive_listener(self, update_callback: TimeServiceCallback) -> CALLBACK_TYPE:
+        """
+        Listen for time-sensitive updates that occur every quarter-hour.
+
+        Time-sensitive entities (like current_interval_price, next_interval_price, etc.) should use this
+        method instead of async_add_listener to receive updates at quarter-hour boundaries.
+
+        Returns:
+            Callback that can be used to remove the listener
+
+        """
+        return self._listener_manager.async_add_time_sensitive_listener(update_callback)
+
+    @callback
+    def _async_update_time_sensitive_listeners(self, time_service: TibberPricesTimeService) -> None:
+        """
+        Update all time-sensitive entities without triggering a full coordinator update.
+
+        Args:
+            time_service: TibberPricesTimeService instance with reference time for this update cycle
+
+        """
+        self._listener_manager.async_update_time_sensitive_listeners(time_service)
+
+    @callback
+    def async_add_minute_update_listener(self, update_callback: TimeServiceCallback) -> CALLBACK_TYPE:
+        """
+        Listen for minute-by-minute updates for timing sensors.
+
+        Timing sensors (like best_price_remaining_minutes, peak_price_progress, etc.) should use this
+        method to receive updates every minute for accurate countdown/progress tracking.
+
+        Returns:
+            Callback that can be used to remove the listener
+
+        """
+        return self._listener_manager.async_add_minute_update_listener(update_callback)
+
+    @callback
+    def _async_update_minute_listeners(self, time_service: TibberPricesTimeService) -> None:
+        """
+        Update all minute-update entities without triggering a full coordinator update.
+
+        Args:
+            time_service: TibberPricesTimeService instance with reference time for this update cycle
+
+        """
+        self._listener_manager.async_update_minute_listeners(time_service)
+
+    @callback
+    def _handle_quarter_hour_refresh(self, _now: datetime | None = None) -> None:
+        """
+        Handle quarter-hour entity refresh (Timer #2).
+
+        This is a SYNCHRONOUS callback (decorated with @callback) - it runs in the event loop
+        without async/await overhead because it performs only fast, non-blocking operations:
+        - Midnight turnover check (date comparison, data rotation)
+        - Listener notifications (entity state updates)
+
+        NO I/O operations (no API calls, no file operations), so no need for async def.
+
+        This is triggered at exact quarter-hour boundaries (:00, :15, :30, :45).
+        Does NOT fetch new data - only updates entity states based on existing cached data.
+        """
+        # Create LOCAL TimeService with fresh reference time for this refresh
+        # Each timer has its own TimeService instance - no shared state between timers
+        # This timer updates 30+ time-sensitive entities at quarter-hour boundaries
+        # (Timer #3 handles timing entities separately - no overlap)
+        time_service = TibberPricesTimeService()
+        now = time_service.now()
+
+        # Update shared coordinator time (used by Timer #1 and other operations)
+        # This is safe because we're in a @callback (synchronous event loop)
+        self.time = time_service
+
+        # Update helper modules with fresh TimeService instance
+        self.api.time = time_service
+        self._price_data_manager.time = time_service
+        self._data_transformer.time = time_service
+        self._period_calculator.time = time_service
+
+        self._log("debug", "[Timer #2] Quarter-hour refresh triggered at %s", now.isoformat())
+
+        # Check if midnight has passed since last check
+        midnight_turnover_performed = self._check_and_handle_midnight_turnover(now)
+
+        if midnight_turnover_performed:
+            # Midnight turnover was performed by THIS call (Timer #1 didn't run yet)
+            self._log("info", "[Timer #2] Midnight turnover performed, entities updated")
+            # Schedule cache save asynchronously (we're in a callback)
+            self.hass.async_create_task(self._store_cache())
+            # async_update_listeners() was already called in _check_and_handle_midnight_turnover
+            # This includes time-sensitive listeners, so skip regular update to avoid double-update
+        else:
+            # Regular quarter-hour refresh - only update time-sensitive entities
+            # (Midnight turnover was either not needed, or already done by Timer #1)
+            # Pass local time_service to entities (not self.time which could be overwritten)
+            self._async_update_time_sensitive_listeners(time_service)
+
+    @callback
+    def _handle_minute_refresh(self, _now: datetime | None = None) -> None:
+        """
+        Handle 30-second entity refresh for timing sensors (Timer #3).
+
+        This is a SYNCHRONOUS callback (decorated with @callback) - it runs in the event loop
+        without async/await overhead because it performs only fast, non-blocking operations:
+        - Listener notifications for timing sensors (remaining_minutes, progress)
+
+        NO I/O operations (no API calls, no file operations), so no need for async def.
+        Runs every 30 seconds to keep sensor values in sync with HA frontend display.
+
+        This runs every 30 seconds to update countdown/progress sensors.
+        Timing calculations use rounded minutes matching HA's relative time display.
+        Does NOT fetch new data - only updates entity states based on existing cached data.
+        """
+        # Create LOCAL TimeService with fresh reference time for this 30-second refresh
+        # Each timer has its own TimeService instance - no shared state between timers
+        # Timer #2 updates 30+ time-sensitive entities (prices, levels, timestamps)
+        # Timer #3 updates 6 timing entities (remaining_minutes, progress, next_in_minutes)
+        # NO overlap - entities are registered with either Timer #2 OR Timer #3, never both
+        time_service = TibberPricesTimeService()
+
+        # Only log at debug level to avoid log spam (this runs every 30 seconds)
+        self._log("debug", "[Timer #3] 30-second refresh for timing sensors")
+
+        # Update only minute-update entities (remaining_minutes, progress, etc.)
+        # Pass local time_service to entities (not self.time which could be overwritten)
+        self._async_update_minute_listeners(time_service)
+
+    def _check_midnight_turnover_needed(self, now: datetime) -> bool:
+        """
+        Check if midnight turnover is needed (atomic check, no side effects).
+
+        This is called by BOTH Timer #1 and Timer #2 to coordinate turnover.
+        Returns True only if turnover hasn't been performed yet today.
+
+        Args:
+            now: Current datetime
+
+        Returns:
+            True if midnight turnover is needed, False if already done
+
+        """
+        # Initialize handler on first use
+        if self._midnight_handler.last_check_time is None:
+            self._midnight_handler.update_check_time(now)
+            return False
+
+        # Delegate to midnight handler
+        return self._midnight_handler.is_turnover_needed(now)
+
+    def _perform_midnight_data_rotation(self, now: datetime) -> None:
+        """
+        Perform midnight data rotation on cached data (side effects).
+
+        This rotates yesterday/today/tomorrow and updates coordinator data.
+        Called by whoever detects midnight first (Timer #1 or Timer #2).
+
+        IMPORTANT: This method is NOT @callback because it modifies shared state.
+        Call this from async context only to ensure proper serialization.
+
+        Args:
+            now: Current datetime
+
+        """
+        current_date = now.date()
+        last_check_date = (
+            self._midnight_handler.last_check_time.date() if self._midnight_handler.last_check_time else current_date
+        )
+
+        self._log(
+            "debug",
+            "Performing midnight turnover: last_check=%s, current=%s",
+            last_check_date,
+            current_date,
+        )
+
+        # With flat interval list architecture and IntervalPool as source of truth,
+        # no data rotation needed! get_intervals_for_day_offsets() automatically
+        # filters by date. Just re-transform to refresh enrichment.
+        if self.data and "priceInfo" in self.data:
+            # Re-transform data to ensure enrichment is refreshed for new day.
+            # CRITICAL: Preserve currency and home_id (same fix as _handle_options_update).
+            raw_data = {
+                "price_info": self.data["priceInfo"],
+                "currency": self.data.get("currency", "EUR"),
+                "home_id": self._home_id,
+            }
+            self.data = self._transform_data(raw_data)
+
+        # Mark turnover as done for today (atomic update)
+        self._midnight_handler.mark_turnover_done(now)
+
+    @callback
+    def _check_and_handle_midnight_turnover(self, now: datetime) -> bool:
+        """
+        Check if midnight has passed and perform data rotation if needed.
+
+        This is called by Timer #2 (quarter-hour refresh) to ensure timely rotation
+        without waiting for the next API update cycle.
+
+        Coordinates with Timer #1 using atomic check on _last_midnight_check date.
+        If Timer #1 already performed turnover, this skips gracefully.
+
+        Returns:
+            True if midnight turnover was performed by THIS call, False otherwise
+
+        """
+        # Check if turnover is needed (atomic, no side effects)
+        if not self._check_midnight_turnover_needed(now):
+            # Already done today (by Timer #1 or previous Timer #2 call)
+            return False
+
+        # Turnover needed - perform it
+        # Note: We need to schedule this as a task because _perform_midnight_data_rotation
+        # is not a callback and may need async operations
+        self._log("info", "[Timer #2] Midnight turnover detected, performing data rotation")
+        self._perform_midnight_data_rotation(now)
+
+        # CRITICAL: Notify BOTH listener groups after midnight turnover
+        # - async_update_listeners(): Notifies normal entities (via HA's DataUpdateCoordinator)
+        # - async_update_time_sensitive_listeners(): Notifies time-sensitive entities (custom system)
+        # Without both calls, period binary sensors (best_price_period, peak_price_period)
+        # won't update because they're time-sensitive listeners, not normal listeners.
+        self.async_update_listeners()
+
+        # Create TimeService with fresh reference time for time-sensitive entity updates
+        time_service = TibberPricesTimeService()
+        self._async_update_time_sensitive_listeners(time_service)
+
+        return True
+
+    async def async_shutdown(self) -> None:
+        """
+        Shut down the coordinator and clean up timers.
+
+        Cancels all three timer types:
+        - Timer #1: API polling (coordinator update timer)
+        - Timer #2: Quarter-hour entity updates
+        - Timer #3: Minute timing sensor updates
+
+        Also saves cache to persist any unsaved changes and clears all repairs.
+        """
+        # Cancel all timers first
+        self._listener_manager.cancel_timers()
+
+        # Clear all repairs when integration is removed or disabled
+        await self._repair_manager.clear_all_repairs()
+
+        # Save cache to persist any unsaved data
+        # This ensures we don't lose data if HA is shutting down
+        try:
+            await self._store_cache()
+            self._log("debug", "Cache saved during shutdown")
+        except OSError as err:
+            # Log but don't raise - shutdown should complete even if cache save fails
+            self._log("error", "Failed to save cache during shutdown: %s", err)
+
+    async def _async_update_data(self) -> dict[str, Any]:
+        """
+        Fetch data from Tibber API (called by DataUpdateCoordinator timer).
+
+        This is Timer #1 (HA's built-in coordinator timer, every 15 min).
+        """
+        self._log("debug", "[Timer #1] DataUpdateCoordinator check triggered")
+
+        # Track when Timer #1 ran (for next_api_poll calculation)
+        self._last_coordinator_update = self.time.now()
+
+        # Create TimeService with fresh reference time for this update cycle
+        self.time = TibberPricesTimeService()
+        current_time = self.time.now()
+
+        # Transition lifecycle state from "fresh" to "cached" if enough time passed
+        # (5 minutes threshold defined in lifecycle calculator)
+        # Note: This updates _lifecycle_state for diagnostics only.
+        # The lifecycle sensor calculates its state dynamically in get_lifecycle_state(),
+        # checking _last_price_update timestamp directly.
+        if self._lifecycle_state == "fresh":
+            # After 5 minutes, data is considered "cached" (no longer "just fetched")
+            self._lifecycle_state = "cached"
+
+        # Update helper modules with fresh TimeService instance
+        self.api.time = self.time
+        self._price_data_manager.time = self.time
+        self._data_transformer.time = self.time
+        self._period_calculator.time = self.time
+
+        # Load cache if not already loaded (user data only, price data is in Pool)
+        if self._cached_user_data is None:
+            await self.load_cache()
+
+        # Initialize midnight handler on first run
+        if self._midnight_handler.last_check_time is None:
+            self._midnight_handler.update_check_time(current_time)
+
+        # CRITICAL: Check for midnight turnover FIRST (before any data operations)
+        # This prevents race condition with Timer #2 (quarter-hour refresh)
+        # Whoever runs first (Timer #1 or Timer #2) performs turnover, the other skips
+        midnight_turnover_needed = self._check_midnight_turnover_needed(current_time)
+        if midnight_turnover_needed:
+            self._log("info", "[Timer #1] Midnight turnover detected, performing data rotation")
+            self._perform_midnight_data_rotation(current_time)
+            # After rotation, save cache and notify entities
+            await self._store_cache()
+
+            # CRITICAL: Notify time-sensitive listeners explicitly
+            # When Timer #1 performs turnover, returning self.data will trigger
+            # async_update_listeners() (normal listeners) automatically via DataUpdateCoordinator.
+            # But time-sensitive listeners (like best_price_period, peak_price_period)
+            # won't be notified unless we explicitly call their update method.
+            # This ensures ALL entities see the updated periods after midnight turnover.
+            time_service = TibberPricesTimeService()
+            self._async_update_time_sensitive_listeners(time_service)
+
+            # Return current data (enriched after rotation) to trigger entity updates
+            if self.data:
+                return self.data
+
+        try:
+            # Reset API call counter if day changed
+            current_date = current_time.date()
+            if self._last_api_call_date != current_date:
+                self._api_calls_today = 0
+                self._last_api_call_date = current_date
+
+            # Set _is_fetching flag - lifecycle sensor shows "refreshing" during fetch
+            # Note: Lifecycle sensor reads this flag directly in get_lifecycle_state()
+            self._is_fetching = True
+
+            # Get current price info to check if tomorrow data already exists
+            current_price_info = self.data.get("priceInfo", []) if self.data else []
+
+            result, api_called = await self._price_data_manager.handle_main_entry_update(
+                current_time,
+                self._home_id,
+                self._transform_data,
+                current_price_info=current_price_info,
+            )
+
+            # CRITICAL: Reset fetching flag AFTER data fetch completes
+            self._is_fetching = False
+
+            # Sync user_data cache (price data is in IntervalPool)
+            self._cached_user_data = self._price_data_manager.cached_user_data
+
+            # Update lifecycle tracking - ONLY if API was actually called
+            # (not when returning cached data)
+            if api_called and result and "priceInfo" in result and len(result["priceInfo"]) > 0:
+                self._last_price_update = current_time  # Track when data was fetched from API
+                self._api_calls_today += 1
+                self._lifecycle_state = "fresh"  # Data just fetched
+                _LOGGER.debug(
+                    "API call completed: Fetched %d intervals, updating lifecycle to 'fresh'",
+                    len(result["priceInfo"]),
+                )
+                # Note: _lifecycle_state is for diagnostics only.
+                # Lifecycle sensor calculates state dynamically from _last_price_update.
+            elif not api_called:
+                # Using cached data - lifecycle stays as is (cached/searching_tomorrow/etc.)
+                _LOGGER.debug(
+                    "Using cached data: %d intervals from pool, no API call made",
+                    len(result.get("priceInfo", [])),
+                )
+        except (
+            TibberPricesApiClientAuthenticationError,
+            TibberPricesApiClientCommunicationError,
+            TibberPricesApiClientError,
+        ) as err:
+            # Reset lifecycle state on error
+            self._is_fetching = False
+            self._lifecycle_state = "error"  # For diagnostics
+            # Note: Lifecycle sensor detects errors via coordinator.last_exception
+
+            # Track rate limit errors for repair system
+            await self._track_rate_limit_error(err)
+
+            # Handle API error - will re-raise as ConfigEntryAuthFailed or UpdateFailed
+            # Note: With IntervalPool, there's no local cache fallback here.
+            # The Pool has its own persistence for offline recovery.
+            await self._price_data_manager.handle_api_error(err)
+            # Note: handle_api_error always raises, this is never reached
+            return {}  # Satisfy type checker
+        else:
+            # Check for repair conditions after successful update
+            await self._check_repair_conditions(result, current_time)
+
+            # Fire event when new data was fetched from API (not cached)
+            if api_called and result and "priceInfo" in result and len(result["priceInfo"]) > 0:
+                self.hass.bus.async_fire(
+                    "tibber_prices_data_updated",
+                    {
+                        "home_id": self._home_id,
+                        "entry_id": self.config_entry.entry_id,
+                        "interval_count": len(result["priceInfo"]),
+                    },
+                )
+
+            return result
+
+    async def _track_rate_limit_error(self, error: Exception) -> None:
+        """Track rate limit errors for repair notification system."""
+        error_str = str(error).lower()
+        is_rate_limit = "429" in error_str or "rate limit" in error_str or "too many requests" in error_str
+        if is_rate_limit:
+            await self._repair_manager.track_rate_limit_error()
+
+    async def _check_repair_conditions(
+        self,
+        result: dict[str, Any],
+        current_time: datetime,
+    ) -> None:
+        """Check and manage repair conditions after successful data update."""
+        # 1. Home not found detection (home was removed from Tibber account)
+        if result and result.get("_home_not_found"):
+            await self._repair_manager.create_home_not_found_repair()
+            # Remove the marker before returning to entities
+            result.pop("_home_not_found", None)
+        else:
+            # Home exists - clear any existing repair
+            await self._repair_manager.clear_home_not_found_repair()
+
+        # 2. Tomorrow data availability (after 18:00)
+        if result and "priceInfo" in result:
+            has_tomorrow_data = self._price_data_manager.has_tomorrow_data(result["priceInfo"])
+            await self._repair_manager.check_tomorrow_data_availability(
+                has_tomorrow_data=has_tomorrow_data,
+                current_time=current_time,
+            )
+
+        # 3. Clear rate limit tracking on successful API call
+        await self._repair_manager.clear_rate_limit_tracking()
+
+    async def load_cache(self) -> None:
+        """Load cached user data from storage (price data is in IntervalPool)."""
+        await self._price_data_manager.load_cache()
+        # Sync user data reference
+        self._cached_user_data = self._price_data_manager.cached_user_data
+        self._last_user_update = self._price_data_manager._last_user_update  # noqa: SLF001 - Sync for lifecycle tracking
+
+        # Note: Midnight handler state is now based on current date
+        # Since price data is in IntervalPool (persistent), we just need to
+        # ensure turnover doesn't happen twice if HA restarts after midnight
+        today_midnight = self.time.as_local(self.time.now()).replace(hour=0, minute=0, second=0, microsecond=0)
+        # Mark today's midnight as done to prevent double turnover on HA restart
+        self._midnight_handler.mark_turnover_done(today_midnight)
+
+    async def _store_cache(self) -> None:
+        """Store cache data (user metadata only, price data is in IntervalPool)."""
+        await self._price_data_manager.store_cache(self._midnight_handler.last_check_time)
+
+    def _needs_tomorrow_data(self) -> bool:
+        """Check if tomorrow data is missing or invalid."""
+        # Check self.data (from Pool) instead of _cached_price_data
+        if not self.data or "priceInfo" not in self.data:
+            return True
+        return helpers.needs_tomorrow_data({"price_info": self.data["priceInfo"]})
+
+    def _has_valid_tomorrow_data(self) -> bool:
+        """Check if we have valid tomorrow data (inverse of _needs_tomorrow_data)."""
+        return not self._needs_tomorrow_data()
+
+    @callback
+    def _merge_cached_data(self) -> dict[str, Any]:
+        """Return current data (from Pool)."""
+        if not self.data:
+            return {}
+        return self.data
+
+    def _get_threshold_percentages(self) -> dict[str, int | float]:
+        """Get threshold percentages from config options."""
+        return self._data_transformer.get_threshold_percentages()
+
+    def _calculate_periods_for_price_info(
+        self, price_info: list[dict[str, Any]], day_patterns: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Calculate periods (best price and peak price) for the given price info."""
+        return self._period_calculator.calculate_periods_for_price_info(price_info, day_patterns)
+
+    def _transform_data(self, raw_data: dict[str, Any]) -> dict[str, Any]:
+        """Transform raw data for main entry (aggregated view of all homes)."""
+        # Delegate complete transformation to DataTransformer (enrichment + periods)
+        # DataTransformer handles its own caching internally
+        return self._data_transformer.transform_data(raw_data)
+
+    # --- Methods expected by sensors and services ---
+
+    def get_home_data(self, home_id: str) -> dict[str, Any] | None:
+        """Get data for a specific home (returns this coordinator's data if home_id matches)."""
+        if not self.data:
+            return None
+
+        # In new architecture, each coordinator manages one home only
+        # Return data only if requesting this coordinator's home
+        if home_id == self._home_id:
+            return self.data
+
+        return None
+
+    def get_current_interval(self) -> dict[str, Any] | None:
+        """Get the price data for the current interval."""
+        if not self.data:
+            return None
+
+        if not self.data:
+            return None
+
+        now = self.time.now()
+        return find_price_data_for_interval(self.data, now, time=self.time)
+
+    async def refresh_user_data(self) -> bool:
+        """Force refresh of user data and return True if data was updated."""
+        try:
+            current_time = self.time.now()
+            self._log("info", "Forcing user data refresh (bypassing cache)")
+
+            # Force update by calling API directly (bypass cache check)
+            user_data = await self.api.async_get_viewer_details()
+            self._cached_user_data = user_data
+            self._last_user_update = current_time
+            self._log("info", "User data refreshed successfully - found %d home(s)", len(user_data.get("homes", [])))
+
+            await self._store_cache()
+        except (
+            TibberPricesApiClientAuthenticationError,
+            TibberPricesApiClientCommunicationError,
+            TibberPricesApiClientError,
+        ):
+            return False
+        else:
+            return True
+
+    def get_user_profile(self) -> dict[str, Any]:
+        """Get user profile information."""
+        return {
+            "last_updated": self._last_user_update,
+            "cached_user_data": self._cached_user_data is not None,
+        }
+
+    def get_user_homes(self) -> list[dict[str, Any]]:
+        """Get list of user homes."""
+        if not self._cached_user_data:
+            return []
+        viewer = self._cached_user_data.get("viewer", {})
+        return viewer.get("homes", [])

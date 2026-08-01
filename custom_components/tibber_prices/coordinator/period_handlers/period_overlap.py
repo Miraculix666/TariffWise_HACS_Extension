@@ -1,0 +1,680 @@
+"""Period overlap resolution logic."""
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from custom_components.tibber_prices.coordinator.time_service import TibberPricesTimeService
+
+    from .types import TibberPricesPeriodConfig
+
+_LOGGER = logging.getLogger(__name__)
+_LOGGER_DETAILS = logging.getLogger(__name__ + ".details")
+
+# Module-local log indentation (each module starts at level 0)
+INDENT_L0 = ""  # Entry point / main function
+INDENT_L1 = "  "  # Nested logic / loop iterations
+INDENT_L2 = "    "  # Deeper nesting
+
+
+def _estimate_merged_cv(period1: dict, period2: dict) -> float | None:
+    """
+    Estimate the CV of a merged period from two period summaries.
+
+    Since we don't have the raw prices, we estimate using the combined min/max range.
+    This is a conservative estimate - the actual CV could be higher or lower.
+
+    Formula: CV ≈ (range / 2) / mean * 100
+    Where range = max - min, mean = (min + max) / 2
+
+    This approximation assumes roughly uniform distribution within the range.
+    """
+    p1_min = period1.get("price_min")
+    p1_max = period1.get("price_max")
+    p2_min = period2.get("price_min")
+    p2_max = period2.get("price_max")
+
+    if None in (p1_min, p1_max, p2_min, p2_max):
+        return None
+
+    # Cast to float - None case handled above
+    combined_min = min(float(p1_min), float(p2_min))  # type: ignore[arg-type]
+    combined_max = max(float(p1_max), float(p2_max))  # type: ignore[arg-type]
+
+    if combined_min <= 0:
+        return None
+
+    combined_mean = (combined_min + combined_max) / 2
+    price_range = combined_max - combined_min
+
+    # CV estimate based on range (assuming uniform distribution)
+    # For uniform distribution: std_dev ≈ range / sqrt(12) ≈ range / 3.46
+    return (price_range / 3.46) / combined_mean * 100
+
+
+def recalculate_period_metadata(periods: list[dict], *, time: TibberPricesTimeService) -> None:
+    """
+    Recalculate period metadata after merging periods.
+
+    Updates period_position, period_count_total, and period_count_remaining for all periods
+    based on chronological order.
+
+    This must be called after resolve_period_overlaps() to ensure metadata
+    reflects the final merged period list.
+
+    Args:
+        periods: List of period summary dicts (mutated in-place)
+        time: TibberPricesTimeService instance (required)
+
+    """
+    if not periods:
+        return
+
+    # Sort periods chronologically by start time
+    periods.sort(key=lambda p: p.get("start") or time.now())
+
+    # Update metadata for all periods
+    total_periods = len(periods)
+
+    for position, period in enumerate(periods, 1):
+        period["period_position"] = position
+        period["period_count_total"] = total_periods
+        period["period_count_remaining"] = total_periods - position
+
+
+def _merge_adjacent_periods_from_summaries(period1: dict, period2: dict) -> dict:
+    """
+    Merge two adjacent or overlapping periods from summary data only.
+
+    The newer period's relaxation attributes override the older period's.
+    Takes the earliest start time and latest end time.
+
+    Price statistics are recombined from both periods so the merged period
+    reflects the actual span (rather than only period1's stats):
+    - price_min: min(period1.price_min, period2.price_min)
+    - price_max: max(period1.price_max, period2.price_max)
+    - price_spread: max - min (recomputed)
+    - price_mean: weighted by period_interval_count when available, else
+      weighted by duration_minutes (kept simple - exact mean would require
+      raw interval prices that aren't carried in the period dict).
+
+    Note: price_median and price_coefficient_variation_% are intentionally NOT
+    recomputed because they cannot be derived from summary stats. They retain
+    period1's values; downstream consumers must treat them as approximate for
+    merged periods (the `merged_from` marker indicates this).
+
+    Relaxation attributes from the newer period (period2) override those from period1:
+    - relaxation_active
+    - relaxation_level
+    - relaxation_threshold_original_%
+    - relaxation_threshold_applied_%
+    - period_interval_level_gap_count
+    - period_interval_smoothed_count
+
+    """
+    # Take earliest start and latest end
+    merged_start = min(period1["start"], period2["start"])
+    merged_end = max(period1["end"], period2["end"])
+    merged_duration = int((merged_end - merged_start).total_seconds() / 60)
+
+    # Start with period1 as base (keeps period_position, period_count_*, ratings, etc.)
+    merged = period1.copy()
+
+    # Update time boundaries
+    merged["start"] = merged_start
+    merged["end"] = merged_end
+    merged["duration_minutes"] = merged_duration
+
+    # Recombine price extremes from both periods
+    p1_min = period1.get("price_min")
+    p2_min = period2.get("price_min")
+    p1_max = period1.get("price_max")
+    p2_max = period2.get("price_max")
+
+    if p1_min is not None and p2_min is not None:
+        merged["price_min"] = round(min(float(p1_min), float(p2_min)), 4)
+    if p1_max is not None and p2_max is not None:
+        merged["price_max"] = round(max(float(p1_max), float(p2_max)), 4)
+    if merged.get("price_min") is not None and merged.get("price_max") is not None:
+        merged["price_spread"] = round(float(merged["price_max"]) - float(merged["price_min"]), 4)
+
+    # Weighted mean: prefer interval count, fall back to duration
+    p1_mean = period1.get("price_mean")
+    p2_mean = period2.get("price_mean")
+    if p1_mean is not None and p2_mean is not None:
+        p1_weight = period1.get("period_interval_count") or period1.get("duration_minutes") or 1
+        p2_weight = period2.get("period_interval_count") or period2.get("duration_minutes") or 1
+        total_weight = p1_weight + p2_weight
+        if total_weight > 0:
+            merged["price_mean"] = round(
+                (float(p1_mean) * p1_weight + float(p2_mean) * p2_weight) / total_weight,
+                4,
+            )
+
+    # Combine interval count if both have it (overlaps will overcount slightly,
+    # which is acceptable for the weighted-mean use case above)
+    p1_iv = period1.get("period_interval_count")
+    p2_iv = period2.get("period_interval_count")
+    if p1_iv is not None and p2_iv is not None:
+        merged["period_interval_count"] = int(p1_iv) + int(p2_iv)
+
+    # Override with period2's relaxation attributes (newer/higher flex wins)
+    relaxation_attrs = [
+        "relaxation_active",
+        "relaxation_level",
+        "relaxation_threshold_original_%",
+        "relaxation_threshold_applied_%",
+        "period_interval_level_gap_count",
+        "period_interval_smoothed_count",
+    ]
+
+    for attr in relaxation_attrs:
+        if attr in period2:
+            merged[attr] = period2[attr]
+
+    # Mark as merged (for debugging) - downstream consumers can detect that
+    # price_median / price_coefficient_variation_% are approximate.
+    merged["merged_from"] = {
+        "period1_start": period1["start"].isoformat(),
+        "period1_end": period1["end"].isoformat(),
+        "period2_start": period2["start"].isoformat(),
+        "period2_end": period2["end"].isoformat(),
+    }
+
+    _LOGGER_DETAILS.debug(
+        "%sMerged periods: %s-%s + %s-%s → %s-%s (duration: %d min, mean: %s)",
+        INDENT_L2,
+        period1["start"].strftime("%H:%M"),
+        period1["end"].strftime("%H:%M"),
+        period2["start"].strftime("%H:%M"),
+        period2["end"].strftime("%H:%M"),
+        merged_start.strftime("%H:%M"),
+        merged_end.strftime("%H:%M"),
+        merged_duration,
+        merged.get("price_mean"),
+    )
+
+    return merged
+
+
+def _build_raw_merge_context(
+    all_prices: list[dict],
+    config: TibberPricesPeriodConfig,
+    *,
+    time: TibberPricesTimeService,
+) -> dict[str, Any] | None:
+    """Build reusable context for raw-interval merge recomputation."""
+    from .period_building import calculate_reference_prices, split_intervals_by_day  # noqa: PLC0415
+    from .types import TibberPricesThresholdConfig  # noqa: PLC0415
+
+    sorted_prices = sorted(
+        all_prices,
+        key=lambda price_data: time.get_interval_time(price_data) or time.now(),
+    )
+
+    interval_lookup: dict[Any, dict] = {}
+    for price_data in sorted_prices:
+        if (interval_start := time.get_interval_time(price_data)) is not None:
+            interval_lookup[interval_start] = price_data
+
+    if not interval_lookup:
+        return None
+
+    intervals_by_day, avg_price_by_day = split_intervals_by_day(sorted_prices, time=time)
+    ref_prices = calculate_reference_prices(intervals_by_day, reverse_sort=config.reverse_sort)
+    thresholds = TibberPricesThresholdConfig(
+        threshold_low=config.threshold_low,
+        threshold_high=config.threshold_high,
+        threshold_volatility_moderate=config.threshold_volatility_moderate,
+        threshold_volatility_high=config.threshold_volatility_high,
+        threshold_volatility_very_high=config.threshold_volatility_very_high,
+        reverse_sort=config.reverse_sort,
+    )
+
+    return {
+        "interval_duration": time.get_interval_duration(),
+        "interval_lookup": interval_lookup,
+        "price_context": {
+            "ref_prices": ref_prices,
+            "avg_prices": avg_price_by_day,
+            "intervals_by_day": intervals_by_day,
+        },
+        "thresholds": thresholds,
+    }
+
+
+def _collect_period_price_data(
+    merged_start: Any,
+    merged_end: Any,
+    merge_context: dict[str, Any],
+) -> list[dict] | None:
+    """Collect the contiguous raw intervals for a merged period span."""
+    interval_lookup = merge_context["interval_lookup"]
+    interval_duration = merge_context["interval_duration"]
+
+    period_price_data: list[dict] = []
+    cursor = merged_start
+
+    while cursor < merged_end:
+        if (price_data := interval_lookup.get(cursor)) is None:
+            return None
+        period_price_data.append(price_data)
+        cursor += interval_duration
+
+    return period_price_data
+
+
+def _rebuild_merged_period_from_raw(
+    period1: dict,
+    period2: dict,
+    merge_context: dict[str, Any],
+) -> dict | None:
+    """Rebuild merged period statistics from the raw interval union."""
+    from custom_components.tibber_prices.utils.price import (  # noqa: PLC0415
+        aggregate_period_levels,
+        aggregate_period_ratings,
+        calculate_coefficient_of_variation,
+        calculate_volatility_level,
+    )
+
+    from .period_statistics import (  # noqa: PLC0415
+        build_period_summary_dict,
+        calculate_aggregated_rating_difference,
+        calculate_period_price_diff,
+        calculate_period_price_statistics,
+    )
+    from .types import TibberPricesPeriodData, TibberPricesPeriodStatistics  # noqa: PLC0415
+
+    merged_start = min(period1["start"], period2["start"])
+    merged_end = max(period1["end"], period2["end"])
+    period_price_data = _collect_period_price_data(merged_start, merged_end, merge_context)
+
+    if not period_price_data:
+        return None
+
+    thresholds = merge_context["thresholds"]
+    price_context = merge_context["price_context"]
+
+    aggregated_level = aggregate_period_levels(period_price_data)
+    aggregated_rating = None
+    if thresholds.threshold_low is not None and thresholds.threshold_high is not None:
+        aggregated_rating, _ = aggregate_period_ratings(
+            period_price_data,
+            thresholds.threshold_low,
+            thresholds.threshold_high,
+        )
+
+    price_stats = calculate_period_price_statistics(period_price_data)
+    period_price_diff, period_price_diff_pct = calculate_period_price_diff(
+        price_stats["price_mean"],
+        merged_start,
+        price_context,
+    )
+    prices_for_volatility = [float(price_data["total"]) for price_data in period_price_data if "total" in price_data]
+    period_cv = calculate_coefficient_of_variation(prices_for_volatility)
+    volatility = calculate_volatility_level(
+        prices_for_volatility,
+        threshold_moderate=thresholds.threshold_volatility_moderate,
+        threshold_high=thresholds.threshold_volatility_high,
+        threshold_very_high=thresholds.threshold_volatility_very_high,
+    ).lower()
+    rating_difference_pct = calculate_aggregated_rating_difference(period_price_data)
+
+    merged = build_period_summary_dict(
+        TibberPricesPeriodData(
+            start_time=merged_start,
+            end_time=merged_end,
+            period_length=len(period_price_data),
+            period_idx=1,
+            total_periods=1,
+        ),
+        TibberPricesPeriodStatistics(
+            aggregated_level=aggregated_level,
+            aggregated_rating=aggregated_rating,
+            rating_difference_pct=rating_difference_pct,
+            price_mean=price_stats["price_mean"],
+            price_median=price_stats["price_median"],
+            price_min=price_stats["price_min"],
+            price_max=price_stats["price_max"],
+            price_spread=price_stats["price_spread"],
+            volatility=volatility,
+            coefficient_of_variation=round(period_cv, 1) if period_cv is not None else None,
+            period_price_diff=period_price_diff,
+            period_price_diff_pct=period_price_diff_pct,
+        ),
+        reverse_sort=thresholds.reverse_sort,
+        price_context=price_context,
+    )
+
+    if period1.get("relaxation_active") or period2.get("relaxation_active"):
+        merged["relaxation_active"] = True
+
+    for attr in (
+        "relaxation_level",
+        "relaxation_threshold_original_%",
+        "relaxation_threshold_applied_%",
+        "duration_fallback_active",
+        "duration_fallback_min_length",
+    ):
+        if attr in period2:
+            merged[attr] = period2[attr]
+        elif attr in period1:
+            merged[attr] = period1[attr]
+
+    for attr in (
+        "period_interval_level_gap_count",
+        "period_interval_smoothed_count",
+    ):
+        total = 0
+        has_value = False
+        for period in (period1, period2):
+            if (value := period.get(attr)) is not None:
+                total += int(value)
+                has_value = True
+        if has_value:
+            merged[attr] = total
+
+    merged["merged_from"] = {
+        "period1_start": period1["start"].isoformat(),
+        "period1_end": period1["end"].isoformat(),
+        "period2_start": period2["start"].isoformat(),
+        "period2_end": period2["end"].isoformat(),
+    }
+
+    _LOGGER_DETAILS.debug(
+        "%sMerged periods from raw intervals: %s-%s + %s-%s → %s-%s (intervals: %d, mean: %s)",
+        INDENT_L2,
+        period1["start"].strftime("%H:%M"),
+        period1["end"].strftime("%H:%M"),
+        period2["start"].strftime("%H:%M"),
+        period2["end"].strftime("%H:%M"),
+        merged_start.strftime("%H:%M"),
+        merged_end.strftime("%H:%M"),
+        merged.get("period_interval_count"),
+        merged.get("price_mean"),
+    )
+
+    return merged
+
+
+def merge_adjacent_periods(
+    period1: dict,
+    period2: dict,
+    *,
+    merge_context: dict[str, Any] | None = None,
+) -> dict:
+    """
+    Merge two adjacent or overlapping periods into one.
+
+    When raw interval data is available, rebuild the merged summary from the
+    underlying interval union so medians, CV, ratings, and interval counts stay
+    exact after overlap resolution. Falls back to the previous summary-based
+    approximation if the raw slice cannot be recovered.
+
+    """
+    if merge_context is not None and (recomputed := _rebuild_merged_period_from_raw(period1, period2, merge_context)):
+        return recomputed
+
+    if merge_context is not None:
+        _LOGGER.debug(
+            "Falling back to summary-based merge for %s-%s + %s-%s",
+            period1["start"].strftime("%H:%M"),
+            period1["end"].strftime("%H:%M"),
+            period2["start"].strftime("%H:%M"),
+            period2["end"].strftime("%H:%M"),
+        )
+
+    return _merge_adjacent_periods_from_summaries(period1, period2)
+
+
+def _check_merge_quality_gate(periods_to_merge: list[tuple[int, dict]], relaxed: dict) -> bool:
+    """
+    Check if merging would create a period that's too heterogeneous.
+
+    Returns True if merge is allowed, False if blocked by Quality Gate.
+    """
+    from .relaxation import LOW_PRICE_QUALITY_BYPASS_THRESHOLD  # noqa: PLC0415
+    from .types import PERIOD_MAX_CV  # noqa: PLC0415
+
+    relaxed_start = relaxed["start"]
+    relaxed_end = relaxed["end"]
+
+    for _idx, existing in periods_to_merge:
+        # Low absolute price bypass: if the combined price level is very cheap,
+        # the quality gate is bypassed (same logic as in _check_period_quality).
+        # Estimated combined mean = (combined_min + combined_max) / 2
+        r_min = relaxed.get("price_min")
+        r_max = relaxed.get("price_max")
+        e_min = existing.get("price_min")
+        e_max = existing.get("price_max")
+        if None not in (r_min, r_max, e_min, e_max):
+            combined_min = min(float(r_min), float(e_min))  # type: ignore[arg-type]
+            combined_max = max(float(r_max), float(e_max))  # type: ignore[arg-type]
+            combined_mean = (combined_min + combined_max) / 2
+            if combined_mean < LOW_PRICE_QUALITY_BYPASS_THRESHOLD:
+                continue  # Very low absolute price → allow merge, check next pair
+
+        estimated_cv = _estimate_merged_cv(existing, relaxed)
+        if estimated_cv is not None and estimated_cv > PERIOD_MAX_CV:
+            _LOGGER.debug(
+                "Merge blocked by Quality Gate: %s-%s + %s-%s would have CV≈%.1f%% (max: %.1f%%)",
+                existing["start"].strftime("%H:%M"),
+                existing["end"].strftime("%H:%M"),
+                relaxed_start.strftime("%H:%M"),
+                relaxed_end.strftime("%H:%M"),
+                estimated_cv,
+                PERIOD_MAX_CV,
+            )
+            return False
+    return True
+
+
+def _would_swallow_existing(relaxed: dict, existing_periods: list[dict]) -> bool:
+    """
+    Check if the relaxed period would "swallow" any existing period.
+
+    A period is "swallowed" if the new relaxed period completely contains it.
+    In this case, we should NOT merge - the existing smaller period is more
+    homogeneous and should be preserved.
+
+    This prevents relaxation from replacing good small periods with larger,
+    more heterogeneous ones.
+
+    Returns:
+        True if any existing period would be swallowed (merge should be blocked)
+        False if safe to proceed with merge evaluation
+
+    """
+    relaxed_start = relaxed["start"]
+    relaxed_end = relaxed["end"]
+
+    for existing in existing_periods:
+        existing_start = existing["start"]
+        existing_end = existing["end"]
+
+        # Check if relaxed completely contains existing
+        if relaxed_start <= existing_start and relaxed_end >= existing_end:
+            _LOGGER.debug(
+                "Blocking merge: %s-%s would swallow %s-%s (keeping smaller period)",
+                relaxed_start.strftime("%H:%M"),
+                relaxed_end.strftime("%H:%M"),
+                existing_start.strftime("%H:%M"),
+                existing_end.strftime("%H:%M"),
+            )
+            return True
+
+    return False
+
+
+def _is_duplicate_period(relaxed: dict, existing_periods: list[dict], tolerance_seconds: int = 60) -> bool:
+    """Check if relaxed period is a duplicate of any existing period."""
+    relaxed_start = relaxed["start"]
+    relaxed_end = relaxed["end"]
+
+    for existing in existing_periods:
+        if (
+            abs((relaxed_start - existing["start"]).total_seconds()) < tolerance_seconds
+            and abs((relaxed_end - existing["end"]).total_seconds()) < tolerance_seconds
+        ):
+            _LOGGER_DETAILS.debug(
+                "%sSkipping duplicate period %s-%s (already exists)",
+                INDENT_L1,
+                relaxed_start.strftime("%H:%M"),
+                relaxed_end.strftime("%H:%M"),
+            )
+            return True
+    return False
+
+
+def _find_adjacent_or_overlapping(relaxed: dict, existing_periods: list[dict]) -> list[tuple[int, dict]]:
+    """Find all periods that are adjacent to or overlapping with the relaxed period."""
+    relaxed_start = relaxed["start"]
+    relaxed_end = relaxed["end"]
+    periods_to_merge = []
+
+    for idx, existing in enumerate(existing_periods):
+        existing_start = existing["start"]
+        existing_end = existing["end"]
+
+        # Check if adjacent (no gap) or overlapping
+        is_adjacent = relaxed_end == existing_start or relaxed_start == existing_end
+        is_overlapping = relaxed_start < existing_end and relaxed_end > existing_start
+
+        if is_adjacent or is_overlapping:
+            periods_to_merge.append((idx, existing))
+            _LOGGER_DETAILS.debug(
+                "%sPeriod %s-%s %s with existing period %s-%s",
+                INDENT_L1,
+                relaxed_start.strftime("%H:%M"),
+                relaxed_end.strftime("%H:%M"),
+                "overlaps" if is_overlapping else "is adjacent to",
+                existing_start.strftime("%H:%M"),
+                existing_end.strftime("%H:%M"),
+            )
+
+    return periods_to_merge
+
+
+def resolve_period_overlaps(
+    existing_periods: list[dict],
+    new_relaxed_periods: list[dict],
+    *,
+    all_prices: list[dict] | None = None,
+    config: TibberPricesPeriodConfig | None = None,
+    time: TibberPricesTimeService | None = None,
+) -> tuple[list[dict], int]:
+    """
+    Resolve overlaps between existing periods and newly found relaxed periods.
+
+    Adjacent or overlapping periods are merged into single continuous periods.
+    The newer period's relaxation attributes override the older period's.
+
+    Quality Gate: Merging is blocked if the combined period would have
+    an estimated CV above PERIOD_MAX_CV (25%), to prevent creating
+    periods with excessive internal price variation.
+
+    This function is called incrementally after each relaxation phase:
+    - Phase 1: existing = baseline, new = first relaxation
+    - Phase 2: existing = baseline + phase 1, new = second relaxation
+    - Phase 3: existing = baseline + phase 1 + phase 2, new = third relaxation
+
+    Args:
+        existing_periods: All previously found periods (baseline + earlier relaxation phases)
+        new_relaxed_periods: Periods found in current relaxation phase (will be merged if adjacent)
+        all_prices: Optional raw interval data for exact merged-summary recomputation
+        config: Optional period config used to rebuild merged summaries from raw data
+        time: Optional time service for interval alignment during raw recomputation
+
+    Returns:
+        Tuple of (merged_periods, new_periods_count):
+        - merged_periods: All periods after merging, sorted by start time
+        - new_periods_count: Number of new periods added (some may have been merged)
+
+    """
+    _LOGGER_DETAILS.debug(
+        "%sresolve_period_overlaps called: existing=%d, new=%d",
+        INDENT_L0,
+        len(existing_periods),
+        len(new_relaxed_periods),
+    )
+
+    if not new_relaxed_periods:
+        return existing_periods.copy(), 0
+
+    if not existing_periods:
+        # No existing periods - return all new periods
+        return new_relaxed_periods.copy(), len(new_relaxed_periods)
+
+    merged = existing_periods.copy()
+    periods_added = 0
+    merge_context = None
+
+    if all_prices is not None and config is not None and time is not None:
+        merge_context = _build_raw_merge_context(all_prices, config, time=time)
+
+    for relaxed in new_relaxed_periods:
+        relaxed_start = relaxed["start"]
+        relaxed_end = relaxed["end"]
+
+        # Check if this period is duplicate (exact match within tolerance)
+        if _is_duplicate_period(relaxed, merged):
+            continue
+
+        # Check if this period would "swallow" an existing smaller period
+        # In that case, skip it - the smaller existing period is more homogeneous
+        if _would_swallow_existing(relaxed, merged):
+            continue
+
+        # Find periods that are adjacent or overlapping (should be merged)
+        periods_to_merge = _find_adjacent_or_overlapping(relaxed, merged)
+
+        if not periods_to_merge:
+            # No merge needed - add as new period
+            merged.append(relaxed)
+            periods_added += 1
+            _LOGGER_DETAILS.debug(
+                "%sAdded new period %s-%s (no overlap/adjacency)",
+                INDENT_L1,
+                relaxed_start.strftime("%H:%M"),
+                relaxed_end.strftime("%H:%M"),
+            )
+            continue
+
+        # Quality Gate: Check if merging would create a period that's too heterogeneous
+        should_merge = _check_merge_quality_gate(periods_to_merge, relaxed)
+
+        if not should_merge:
+            # Don't merge - add as separate period instead
+            merged.append(relaxed)
+            periods_added += 1
+            _LOGGER_DETAILS.debug(
+                "%sAdded new period %s-%s separately (merge blocked by CV gate)",
+                INDENT_L1,
+                relaxed_start.strftime("%H:%M"),
+                relaxed_end.strftime("%H:%M"),
+            )
+            continue
+
+        # Merge with all adjacent/overlapping periods
+        # Start with the new relaxed period
+        merged_period = relaxed.copy()
+
+        # Remove old periods (in reverse order to maintain indices)
+        for idx, existing in reversed(periods_to_merge):
+            merged_period = merge_adjacent_periods(existing, merged_period, merge_context=merge_context)
+            merged.pop(idx)
+
+        # Add the merged result
+        merged.append(merged_period)
+
+        # Count as added if we merged exactly one existing period
+        # (means we extended/merged, not replaced multiple)
+        if len(periods_to_merge) == 1:
+            periods_added += 1
+
+    # Sort all periods by start time
+    merged.sort(key=lambda p: p["start"])
+
+    return merged, periods_added

@@ -1,0 +1,105 @@
+"""
+Cache management for coordinator persistent storage.
+
+This module handles persistent storage for the coordinator, storing:
+- user_data: Account/home metadata (required, refreshed daily)
+- Timestamps for cache validation and lifecycle tracking
+
+**Storage Architecture (as of v0.25.0):**
+
+There are TWO persistent storage files per config entry:
+
+1. `tibber_prices.{entry_id}` (this module)
+   - user_data: Account info, home metadata, timezone, currency
+   - Timestamps: last_user_update, last_midnight_check
+
+2. `tibber_prices.interval_pool.{entry_id}` (interval_pool/storage.py)
+   - Intervals: Deduplicated quarter-hourly price data (source of truth)
+   - Fetch metadata: When each interval was fetched
+   - Protected range: Which intervals to keep during cleanup
+
+**Single Source of Truth:**
+Price intervals are ONLY stored in IntervalPool. This cache stores only
+user metadata and timestamps. The IntervalPool handles all price data
+fetching, caching, and persistence independently.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING, Any, NamedTuple
+
+if TYPE_CHECKING:
+    from datetime import datetime
+
+    from homeassistant.helpers.storage import Store
+
+    from .time_service import TibberPricesTimeService
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class TibberPricesCacheData(NamedTuple):
+    """Cache data structure for user metadata (price data is in IntervalPool)."""
+
+    user_data: dict[str, Any] | None
+    last_user_update: datetime | None
+    last_midnight_check: datetime | None
+
+
+async def load_cache(
+    store: Store,
+    log_prefix: str,
+    *,
+    time: TibberPricesTimeService,
+) -> TibberPricesCacheData:
+    """Load cached user data from storage (price data is in IntervalPool)."""
+    try:
+        stored = await store.async_load()
+        if stored:
+            cached_user_data = stored.get("user_data")
+
+            # Restore timestamps
+            last_user_update = None
+            last_midnight_check = None
+
+            if last_user_update_str := stored.get("last_user_update"):
+                last_user_update = time.parse_datetime(last_user_update_str)
+            if last_midnight_check_str := stored.get("last_midnight_check"):
+                last_midnight_check = time.parse_datetime(last_midnight_check_str)
+
+            _LOGGER.debug("%s Cache loaded successfully", log_prefix)
+            return TibberPricesCacheData(
+                user_data=cached_user_data,
+                last_user_update=last_user_update,
+                last_midnight_check=last_midnight_check,
+            )
+
+        _LOGGER.debug("%s No cache found, will fetch fresh data", log_prefix)
+    except OSError as ex:
+        _LOGGER.warning("%s Failed to load cache: %s", log_prefix, ex)
+
+    return TibberPricesCacheData(
+        user_data=None,
+        last_user_update=None,
+        last_midnight_check=None,
+    )
+
+
+async def save_cache(
+    store: Store,
+    cache_data: TibberPricesCacheData,
+    log_prefix: str,
+) -> None:
+    """Store cache data (user metadata only, price data is in IntervalPool)."""
+    data = {
+        "user_data": cache_data.user_data,
+        "last_user_update": (cache_data.last_user_update.isoformat() if cache_data.last_user_update else None),
+        "last_midnight_check": (cache_data.last_midnight_check.isoformat() if cache_data.last_midnight_check else None),
+    }
+
+    try:
+        await store.async_save(data)
+        _LOGGER.debug("%s Cache stored successfully", log_prefix)
+    except OSError:
+        _LOGGER.exception("%s Failed to store cache", log_prefix)

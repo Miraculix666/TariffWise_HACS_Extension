@@ -1,0 +1,1085 @@
+"""Relaxation strategy for finding minimum periods per day."""
+
+from __future__ import annotations
+
+from datetime import timedelta
+import logging
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from datetime import date, datetime
+
+    from custom_components.tibber_prices.coordinator.time_service import TibberPricesTimeService
+
+from custom_components.tibber_prices.utils.price import calculate_coefficient_of_variation, calculate_iqr_stats
+
+from .period_overlap import recalculate_period_metadata, resolve_period_overlaps
+from .types import (
+    INDENT_L0,
+    INDENT_L1,
+    INDENT_L2,
+    LOW_PRICE_QUALITY_BYPASS_THRESHOLD,
+    PERIOD_MAX_CV,
+    RELAXATION_FLEX_INCREMENT,
+    TibberPricesPeriodConfig,
+)
+
+_LOGGER = logging.getLogger(__name__)
+_LOGGER_DETAILS = logging.getLogger(__name__ + ".details")
+
+# Flex thresholds for warnings (see docs/development/period-calculation-theory.md)
+# With relaxation active, high base flex is counterproductive (reduces relaxation effectiveness)
+FLEX_WARNING_THRESHOLD_RELAXATION = 0.25  # 25% - INFO: suggest lowering to 15-20%
+MAX_FLEX_HARD_LIMIT = 0.50  # 50% - hard maximum flex value
+FLEX_HIGH_THRESHOLD_RELAXATION = 0.30  # 30% - WARNING: base flex too high for relaxation mode
+
+# Min duration fallback constants
+# When all relaxation phases are exhausted and still no periods found,
+# gradually reduce min_period_length to find at least something
+MIN_DURATION_FALLBACK_MINIMUM = 30  # Minimum period length to try (30 min = 2 intervals)
+MIN_DURATION_FALLBACK_STEP = 15  # Reduce by 15 min (1 interval) each step
+
+
+# Span-to-ref ratio threshold for suppressing flex warnings on V-shape days.
+# When span / ref_price < this on ANY available day, the warning is shown.
+# Below 0.5 means span < 50% of ref_price → "normal" day (high flex is genuinely risky).
+# Above 0.5 means V-shape day (span-based formula already compensates → warning less relevant).
+FLEX_WARNING_VSHAPE_RATIO = 0.5  # span/ref_price ratio below which a day is considered "normal"
+# On flat price days (low variation), it is unrealistic to require multiple distinct
+# best/peak price periods. Requiring 2+ periods would force relaxation to create
+# artificial periods that don't represent genuine price structure.
+LOW_CV_FLAT_DAY_THRESHOLD = 10.0  # %: fallback when IQR% not available (near-zero or negative median)
+# IQR% ≤ 15% ≈ CV ≤ 10% for clean data, but also catches "flat + isolated spike" days correctly:
+# a single spike inflates CV to 15-25% while leaving IQR% near 0-5%.
+LOW_IQR_PCT_FLAT_DAY_THRESHOLD = 15.0  # %: days with IQR% ≤ this need only 1 period
+
+
+def _check_period_quality(
+    period: dict, all_prices: list[dict], *, time: TibberPricesTimeService
+) -> tuple[bool, float | None]:
+    """
+    Check if a period passes the quality gate (internal CV not too high).
+
+    The Quality Gate prevents relaxation from creating periods with too much
+    internal price variation. A "best price period" with prices ranging from
+    0.5 to 1.0 kr/kWh is not useful - user can't trust it's actually "best".
+
+    Args:
+        period: Period summary dict with "start" and "end" datetime
+        all_prices: All price intervals (to look up prices for CV calculation)
+        time: Time service for interval time parsing
+
+    Returns:
+        Tuple of (passes_quality_gate, cv_value)
+        - passes_quality_gate: True if CV <= PERIOD_MAX_CV
+        - cv_value: Calculated CV as percentage, or None if not calculable
+
+    """
+    start_time = period.get("start")
+    end_time = period.get("end")
+
+    if not start_time or not end_time:
+        return True, None  # Can't check, assume OK
+
+    # Build lookup for prices
+    price_lookup: dict[str, float] = {}
+    for price_data in all_prices:
+        interval_time = time.get_interval_time(price_data)
+        if interval_time:
+            price_lookup[interval_time.isoformat()] = float(price_data["total"])
+
+    # Collect prices within the period
+    period_prices: list[float] = []
+    interval_duration = time.get_interval_duration()
+
+    current = start_time
+    while current < end_time:
+        price = price_lookup.get(current.isoformat())
+        if price is not None:
+            period_prices.append(price)
+        current = current + interval_duration
+
+    # Need at least 2 prices to calculate CV (same as MIN_PRICES_FOR_VOLATILITY in price.py)
+    min_prices_for_cv = 2
+    if len(period_prices) < min_prices_for_cv:
+        return True, None  # Too few prices to calculate CV
+
+    cv = calculate_coefficient_of_variation(period_prices)
+    if cv is None:
+        return True, None
+
+    # Low absolute price bypass: when the MEAN period price is very cheap (below
+    # LOW_PRICE_QUALITY_BYPASS_THRESHOLD), relative CV becomes unreliable.
+    # Example: period at 1-4 ct (mean 2 ct) shows CV≈50% but is practically
+    # homogeneous from a cost perspective; the quality gate should not reject it.
+    # Using mean (not range) to distinguish genuinely cheap days from flat-priced
+    # normal days: a flat day at 33-36 ct has a small range BUT a high mean → no bypass.
+    period_mean = sum(period_prices) / len(period_prices)
+    if period_mean < LOW_PRICE_QUALITY_BYPASS_THRESHOLD:
+        return True, cv  # Passes quality gate: absolute price level is very low
+
+    passes = cv <= PERIOD_MAX_CV
+    return passes, cv
+
+
+def _count_quality_periods(
+    periods: list[dict],
+    all_prices: list[dict],
+    prices_by_day: dict[date, list[dict]],
+    min_periods: int,
+    *,
+    time: TibberPricesTimeService,
+) -> tuple[int, int]:
+    """
+    Count days meeting requirement when considering quality gate.
+
+    Only periods passing the quality gate (CV <= PERIOD_MAX_CV) are counted
+    towards meeting the min_periods requirement.
+
+    Args:
+        periods: List of all periods
+        all_prices: All price intervals
+        prices_by_day: Price intervals grouped by day
+        min_periods: Target periods per day
+        time: Time service
+
+    Returns:
+        Tuple of (days_meeting_requirement, total_quality_periods)
+
+    """
+    periods_by_day = group_periods_by_day(periods)
+    days_meeting_requirement = 0
+    total_quality_periods = 0
+
+    for day in sorted(prices_by_day.keys()):
+        day_periods = periods_by_day.get(day, [])
+        quality_count = 0
+
+        for period in day_periods:
+            passes, cv = _check_period_quality(period, all_prices, time=time)
+            if passes:
+                quality_count += 1
+            else:
+                _LOGGER_DETAILS.debug(
+                    "%s      Day %s: Period %s-%s REJECTED by quality gate (CV=%.1f%% > %.1f%%)",
+                    INDENT_L2,
+                    day,
+                    period.get("start", "?").strftime("%H:%M") if hasattr(period.get("start"), "strftime") else "?",
+                    period.get("end", "?").strftime("%H:%M") if hasattr(period.get("end"), "strftime") else "?",
+                    cv or 0,
+                    PERIOD_MAX_CV,
+                )
+
+        total_quality_periods += quality_count
+        if quality_count >= min_periods:
+            days_meeting_requirement += 1
+
+    return days_meeting_requirement, total_quality_periods
+
+
+def group_periods_by_day(periods: list[dict]) -> dict[date, list[dict]]:
+    """
+    Group periods by ALL days they span (including midnight crossings).
+
+    Periods crossing midnight are assigned to ALL affected days.
+    Example: Period 23:00 yesterday - 02:00 today appears in BOTH days.
+
+    This ensures that:
+    1. For min_periods checking: A midnight-crossing period counts towards both days
+    2. For binary sensors: Each day shows all relevant periods (including those starting/ending in other days)
+
+    Args:
+        periods: List of period summary dicts with "start" and "end" datetime
+
+    Returns:
+        Dict mapping date to list of periods spanning that date
+
+    """
+    periods_by_day: dict[date, list[dict]] = {}
+
+    for period in periods:
+        start_time = period.get("start")
+        end_time = period.get("end")
+
+        if not start_time or not end_time:
+            continue
+
+        # Assign period to ALL days it spans
+        start_date = start_time.date()
+        end_date = end_time.date()
+
+        # Handle single-day and multi-day periods
+        current_date = start_date
+        while current_date <= end_date:
+            periods_by_day.setdefault(current_date, []).append(period)
+            current_date = current_date + timedelta(days=1)
+
+    return periods_by_day
+
+
+def mark_periods_with_relaxation(
+    periods: list[dict],
+    relaxation_level: str,
+    original_threshold: float,
+    applied_threshold: float,
+    *,
+    reverse_sort: bool = False,
+) -> None:
+    """
+    Mark periods with relaxation information (mutates period dicts in-place).
+
+    Uses consistent 'relaxation_*' prefix for all relaxation-related attributes.
+    These attributes are read by period_overlap.py and binary_sensor/attributes.py.
+
+    For Peak Price periods (reverse_sort=True), thresholds are stored as negative
+    values to match the user's configuration semantics (negative flex = below maximum).
+
+    Args:
+        periods: List of period dicts to mark
+        relaxation_level: String describing the relaxation level (e.g., "flex=18.0% +level_any")
+        original_threshold: Original flex threshold value (decimal, e.g., 0.15 for 15%)
+        applied_threshold: Actually applied threshold value (decimal, e.g., 0.18 for 18%)
+        reverse_sort: True for Peak Price (negative values), False for Best Price (positive values)
+
+    """
+    for period in periods:
+        period["relaxation_active"] = True
+        period["relaxation_level"] = relaxation_level
+        # Convert decimal to percentage for display
+        # For Peak Prices: Store as negative to match user's config semantics
+        sign = -1 if reverse_sort else 1
+        period["relaxation_threshold_original_%"] = round(original_threshold * 100 * sign, 1)
+        period["relaxation_threshold_applied_%"] = round(applied_threshold * 100 * sign, 1)
+
+
+def group_prices_by_day(all_prices: list[dict], *, time: TibberPricesTimeService) -> dict[date, list[dict]]:
+    """
+    Group price intervals by the day they belong to (today and future only).
+
+    Args:
+        all_prices: List of price dicts with "startsAt" timestamp
+        time: TibberPricesTimeService instance (required)
+
+    Returns:
+        Dict mapping date to list of price intervals for that day (only today and future)
+
+    """
+    today = time.now().date()
+    prices_by_day: dict[date, list[dict]] = {}
+
+    for price in all_prices:
+        starts_at = price["startsAt"]  # Already datetime in local timezone
+        if starts_at:
+            price_date = starts_at.date()
+            # Only include today and future days
+            if price_date >= today:
+                prices_by_day.setdefault(price_date, []).append(price)
+
+    return prices_by_day
+
+
+def _try_min_duration_fallback(
+    *,
+    config: TibberPricesPeriodConfig,
+    existing_periods: list[dict],
+    all_prices: list[dict],
+    prices_by_day: dict[date, list[dict]],
+    time: TibberPricesTimeService,
+    max_relaxation_attempts: int = 0,
+    day_patterns_by_date: dict | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """
+    Try reducing min_period_length to find periods when relaxation is exhausted.
+
+    This is a LAST RESORT mechanism. It only activates when:
+    1. All relaxation phases have been tried
+    2. Some days STILL have zero periods (not just below min_periods)
+
+    The fallback progressively reduces min_period_length:
+    - 60 min (default) → 45 min → 30 min (minimum)
+
+    It does NOT reduce below 30 min (2 intervals) because a single 15-min
+    interval is essentially just the daily min/max price - not a "period".
+
+    Args:
+        config: Period configuration
+        existing_periods: Periods found so far (from relaxation)
+        prices_by_day: Price intervals grouped by day
+        time: Time service instance
+        day_patterns_by_date: Optional dict mapping date → day pattern dict. Used for
+            geometric flex bonus in period detection.
+
+    Returns:
+        Tuple of (result dict with periods, metadata dict) or (None, empty metadata)
+
+    """
+    from .core import calculate_periods  # noqa: PLC0415 - Avoid circular import
+
+    metadata: dict[str, Any] = {"phases_used": [], "fallback_active": False}
+
+    # Only try fallback if current min_period_length > minimum
+    if config.min_period_length <= MIN_DURATION_FALLBACK_MINIMUM:
+        return None, metadata
+
+    # Check which days have ZERO periods (not just below target)
+    existing_by_day = group_periods_by_day(existing_periods)
+    days_with_zero_periods = [day for day in prices_by_day if not existing_by_day.get(day)]
+
+    if not days_with_zero_periods:
+        _LOGGER_DETAILS.debug(
+            "%sMin duration fallback: All days have at least one period - no fallback needed",
+            INDENT_L1,
+        )
+        return None, metadata
+
+    _LOGGER.info(
+        "Min duration fallback: %d day(s) have zero periods, trying shorter min_period_length...",
+        len(days_with_zero_periods),
+    )
+
+    # Try progressively shorter min_period_length
+    current_min_duration = config.min_period_length
+    fallback_periods: list[dict] = []
+
+    while current_min_duration > MIN_DURATION_FALLBACK_MINIMUM:
+        current_min_duration = max(
+            current_min_duration - MIN_DURATION_FALLBACK_STEP,
+            MIN_DURATION_FALLBACK_MINIMUM,
+        )
+
+        _LOGGER_DETAILS.debug(
+            "%sTrying min_period_length=%d min for days with zero periods",
+            INDENT_L2,
+            current_min_duration,
+        )
+
+        # Create modified config with shorter min_period_length.
+        # IMPORTANT: We deliberately do NOT max out flex/min_distance here.
+        # Going to MAX_FLEX_HARD_LIMIT (50%) and disabling min_distance + level filter
+        # made every interval qualify on flat-price days, producing phantom periods that
+        # don't represent any real "best/peak" structure. Instead we keep the relaxation's
+        # final flex (the highest the user accepted via max_relaxation_attempts) and
+        # only:
+        #   - drop the level filter (it was already dropped during the last relaxation step)
+        #   - halve min_distance_from_avg (instead of zeroing it) so genuinely flat days
+        #     still surface no period rather than a misleading one.
+        # The shorter min_period_length is what actually unlocks new candidates.
+        relaxation_final_flex = min(
+            abs(config.flex) + max(1, max_relaxation_attempts) * RELAXATION_FLEX_INCREMENT,
+            MAX_FLEX_HARD_LIMIT,
+        )
+        fallback_config = TibberPricesPeriodConfig(
+            reverse_sort=config.reverse_sort,
+            flex=relaxation_final_flex,
+            min_distance_from_avg=config.min_distance_from_avg * 0.5,
+            min_period_length=current_min_duration,
+            threshold_low=config.threshold_low,
+            threshold_high=config.threshold_high,
+            threshold_volatility_moderate=config.threshold_volatility_moderate,
+            threshold_volatility_high=config.threshold_volatility_high,
+            threshold_volatility_very_high=config.threshold_volatility_very_high,
+            level_filter="any",  # Already effectively any after relaxation; keeps gap logic intact
+            gap_count=config.gap_count,
+            extend_to_extreme=config.extend_to_extreme,
+            max_extension_intervals=config.max_extension_intervals,
+        )
+
+        # Try to find periods for days with zero periods
+        for day in days_with_zero_periods:
+            day_prices = prices_by_day.get(day, [])
+            if not day_prices:
+                continue
+
+            try:
+                day_result = calculate_periods(
+                    day_prices,
+                    config=fallback_config,
+                    time=time,
+                    day_patterns_by_date=day_patterns_by_date,
+                )
+
+                day_periods = day_result.get("periods", [])
+                if day_periods:
+                    # Mark periods with fallback metadata
+                    for period in day_periods:
+                        period["duration_fallback_active"] = True
+                        period["duration_fallback_min_length"] = current_min_duration
+                        period["relaxation_active"] = True
+                        period["relaxation_level"] = f"duration_fallback={current_min_duration}min"
+
+                    fallback_periods.extend(day_periods)
+                    _LOGGER.info(
+                        "Min duration fallback: Found %d period(s) for %s at min_length=%d min",
+                        len(day_periods),
+                        day,
+                        current_min_duration,
+                    )
+
+            except (KeyError, ValueError, TypeError) as err:
+                _LOGGER.warning(
+                    "Error during min duration fallback for %s: %s",
+                    day,
+                    err,
+                )
+                continue
+
+        # If we found periods for all zero-period days, we can stop
+        if fallback_periods:
+            # Remove days that now have periods from the list
+            fallback_by_day = group_periods_by_day(fallback_periods)
+            days_with_zero_periods = [day for day in days_with_zero_periods if not fallback_by_day.get(day)]
+
+            if not days_with_zero_periods:
+                break
+
+    if fallback_periods:
+        # Merge with existing periods
+        # resolve_period_overlaps merges adjacent/overlapping periods
+        merged_periods, _new_count = resolve_period_overlaps(
+            existing_periods,
+            fallback_periods,
+            all_prices=all_prices,
+            config=config,
+            time=time,
+        )
+        recalculate_period_metadata(merged_periods, time=time)
+
+        metadata["fallback_active"] = True
+        metadata["phases_used"] = [f"duration_fallback (min_length={current_min_duration}min)"]
+
+        _LOGGER.info(
+            "Min duration fallback complete: Added %d period(s), total now %d",
+            len(fallback_periods),
+            len(merged_periods),
+        )
+
+        return {"periods": merged_periods}, metadata
+
+    _LOGGER.warning(
+        "Min duration fallback: Still %d day(s) with zero periods after trying all durations",
+        len(days_with_zero_periods),
+    )
+    return None, metadata
+
+
+def _compute_day_effective_min(
+    prices_by_day: dict,
+    min_periods: int,
+    *,
+    enable_relaxation: bool,
+    reverse_sort: bool,
+) -> tuple[dict, int]:
+    """
+    Compute per-day effective min_periods with flat-day adaptation.
+
+    On days with very low price variation (IQR% ≤ LOW_IQR_PCT_FLAT_DAY_THRESHOLD),
+    requiring multiple distinct cheapest/peak periods is unrealistic. Finding
+    ONE period is sufficient because there is no meaningful price structure that
+    would create natural multiple periods.
+
+    Uses IQR% as primary metric (robust to isolated price spikes) with CV as
+    fallback when IQR% is undefined (near-zero or negative median prices).
+
+    This applies to both BEST PRICE and PEAK PRICE periods. On flat days,
+    forcing 2+ peaks via relaxation creates cross-day boundary artifacts
+    where overnight prices barely qualify as "peak" only because they are
+    the second-highest block relative to that day's maximum.
+
+    Args:
+        prices_by_day: Dict of date → list of price dicts
+        min_periods: Configured minimum periods per day
+        enable_relaxation: Whether relaxation is enabled
+        reverse_sort: True for peak price, False for best price
+
+    Returns:
+        Tuple of (dict of date → effective min_periods for that day, count of flat days detected)
+
+    """
+    day_effective_min = {}
+    flat_day_count = 0
+
+    for day, day_prices in prices_by_day.items():
+        if not enable_relaxation or min_periods <= 1:
+            # Relaxation disabled or already 1: no adaptation
+            day_effective_min[day] = min_periods
+            continue
+
+        price_values = [float(p["total"]) for p in day_prices if p.get("total") is not None]
+
+        if len(price_values) < 2:
+            day_effective_min[day] = min_periods
+            continue
+
+        # Primary flat-day metric: IQR% is robust to isolated price spikes.
+        # A single spike inflates CV to 15-25% while leaving IQR% near 0-5%,
+        # so IQR correctly identifies "flat core + spike" days as flat.
+        iqr_stats = calculate_iqr_stats(price_values)
+        iqr_pct = iqr_stats["iqr_pct"] if iqr_stats else None
+
+        is_flat = False
+        flat_metric = ""
+
+        if iqr_pct is not None:
+            is_flat = iqr_pct <= LOW_IQR_PCT_FLAT_DAY_THRESHOLD
+            flat_metric = f"IQR%={iqr_pct:.1f}% ≤ {LOW_IQR_PCT_FLAT_DAY_THRESHOLD:.0f}%"
+        else:
+            # IQR% undefined (near-zero or negative median): fall back to CV
+            day_cv = calculate_coefficient_of_variation(price_values)
+            if day_cv is not None:
+                is_flat = day_cv <= LOW_CV_FLAT_DAY_THRESHOLD
+                flat_metric = f"CV={day_cv:.1f}% ≤ {LOW_CV_FLAT_DAY_THRESHOLD:.0f}% (IQR% N/A)"
+
+        if is_flat:
+            day_effective_min[day] = 1
+            flat_day_count += 1
+            _LOGGER_DETAILS.debug(
+                "%sDay %s: flat price profile (%s) → min_periods relaxed to 1",
+                INDENT_L1,
+                day,
+                flat_metric,
+            )
+        else:
+            day_effective_min[day] = min_periods
+
+    if flat_day_count > 0:
+        _LOGGER.info(
+            "Adaptive min_periods: %d flat day(s) (IQR%% ≤ %.0f%%) need only 1 period instead of %d",
+            flat_day_count,
+            LOW_IQR_PCT_FLAT_DAY_THRESHOLD,
+            min_periods,
+        )
+
+    return day_effective_min, flat_day_count
+
+
+def calculate_periods_with_relaxation(
+    all_prices: list[dict],
+    *,
+    config: TibberPricesPeriodConfig,
+    enable_relaxation: bool,
+    min_periods: int,
+    max_relaxation_attempts: int,
+    should_show_callback: Callable[[str | None], bool],
+    time: TibberPricesTimeService,
+    config_entry: Any,  # ConfigEntry type
+    day_patterns_by_date: dict | None = None,
+    time_range: tuple[datetime, datetime] | None = None,
+) -> dict[str, Any]:
+    """
+    Calculate periods with optional global filter relaxation and per-day target tracking.
+
+    Strategy: a single global relaxation loop iterates flex levels (3% steps from
+    the configured base flex up to MAX_FLEX_HARD_LIMIT). At each flex level we
+    first re-run period detection with the configured level filter still intact.
+    Only if that is still insufficient do we retry the same flex with
+    `level_filter="any"`. After every attempt we check, per day, how many quality
+    periods (CV ≤ PERIOD_MAX_CV) have accumulated. Days that already meet the target
+    (`min_periods`) are not re-processed; the loop exits as soon as **all** days meet
+    their target. Days with very flat prices automatically need only 1 period
+    (see `_compute_day_effective_min`).
+
+    If after all flex levels some days still have ZERO periods, a last-resort
+    `min_period_length` fallback is attempted (see `_try_min_duration_fallback`).
+
+    Phase 1: Increase flex threshold step-by-step while preserving the configured
+             level filter.
+    Phase 2: Retry the same flex with `level_filter="any"` when a concrete level
+             filter is configured.
+
+    Args:
+        all_prices: All price data points
+        config: Base period configuration
+        enable_relaxation: Whether relaxation is enabled
+        min_periods: Minimum number of periods required PER DAY
+        max_relaxation_attempts: Maximum number of flex levels (attempts) to try per day
+            before giving up (each attempt runs the full filter matrix). With 3% increment
+            per step, 11 attempts allows escalation from 15% to 48% flex.
+        should_show_callback: Callback function(level_override) -> bool
+            Returns True if periods should be shown with given filter overrides. Pass None
+            to use original configured filter values.
+        time: TibberPricesTimeService instance (required).
+        config_entry: Config entry to get display unit configuration.
+        day_patterns_by_date: Optional dict mapping date → day pattern dict. Used for
+            geometric flex bonus in period detection. Passed through to calculate_periods().
+        time_range: Optional (start_inclusive, end_exclusive) datetime window. When set,
+            only intervals within [start, end) are considered as period candidates.
+            Passed through to calculate_periods(). Used by Phase 4 segment forcing.
+
+    Returns:
+        Dict with same format as calculate_periods() output:
+        - periods: List of period summaries
+        - metadata: Config and statistics (includes relaxation info)
+        - reference_data: Daily min/max/avg prices
+
+    """
+    # Import here to avoid circular dependency
+    from .core import calculate_periods  # noqa: PLC0415
+    from .period_building import filter_superseded_periods  # noqa: PLC0415
+
+    # Compact INFO-level summary
+    period_type = "PEAK PRICE" if config.reverse_sort else "BEST PRICE"
+    relaxation_status = "ON" if enable_relaxation else "OFF"
+    if enable_relaxation:
+        _LOGGER.info(
+            "Calculating %s periods: relaxation=%s, target=%d/day, flex=%.1f%%",
+            period_type,
+            relaxation_status,
+            min_periods,
+            abs(config.flex) * 100,
+        )
+    else:
+        _LOGGER.info(
+            "Calculating %s periods: relaxation=%s, flex=%.1f%%",
+            period_type,
+            relaxation_status,
+            abs(config.flex) * 100,
+        )
+
+    # Detailed DEBUG-level context header
+    period_type_full = "PEAK PRICE (most expensive)" if config.reverse_sort else "BEST PRICE (cheapest)"
+    _LOGGER_DETAILS.debug(
+        "%s========== %s PERIODS ==========",
+        INDENT_L0,
+        period_type_full,
+    )
+    _LOGGER_DETAILS.debug(
+        "%sRelaxation: %s",
+        INDENT_L0,
+        "ENABLED (user setting: ON)" if enable_relaxation else "DISABLED by user configuration",
+    )
+    _LOGGER_DETAILS.debug(
+        "%sBase config: flex=%.1f%%, min_length=%d min",
+        INDENT_L0,
+        abs(config.flex) * 100,
+        config.min_period_length,
+    )
+    if enable_relaxation:
+        _LOGGER_DETAILS.debug(
+            "%sRelaxation target: %d periods per day",
+            INDENT_L0,
+            min_periods,
+        )
+        _LOGGER_DETAILS.debug(
+            "%sRelaxation strategy: 3%% fixed flex increment per step (%d flex levels x 2 filter combinations)",
+            INDENT_L0,
+            max_relaxation_attempts,
+        )
+        _LOGGER_DETAILS.debug(
+            "%sEarly exit: After EACH filter combination when target reached",
+            INDENT_L0,
+        )
+    _LOGGER_DETAILS.debug(
+        "%s=============================================",
+        INDENT_L0,
+    )
+
+    # Validate we have price data
+    if not all_prices:
+        _LOGGER.warning(
+            "No price data available - cannot calculate periods",
+        )
+        return {
+            "periods": [],
+            "metadata": {
+                "relaxation": {
+                    "relaxation_active": False,
+                    "relaxation_attempted": False,
+                    "min_periods_requested": min_periods if enable_relaxation else 0,
+                },
+            },
+            "reference_data": {},
+        }
+
+    # Count available days for logging (today and future only)
+    prices_by_day = group_prices_by_day(all_prices, time=time)
+    total_days = len(prices_by_day)
+
+    # =========================================================================
+    # SPAN-AWARE FLEX WARNINGS
+    # =========================================================================
+    # With the span-based flex formula (flex_base = max(span, ref_price)), a high
+    # configured base_flex is less problematic on V-shape days (single low outlier)
+    # where span dominates. However, on normal days (span ≈ ref_price), high base_flex
+    # leaves little room for relaxation to escalate effectively.
+    #
+    # We only warn when relaxation is enabled AND the flex is high on typical days.
+    # V-shape days have span >> ref_price; normal days have span ≈ ref_price.
+    # We use the MEAN span/ref ratio across available days as a proxy:
+    # - Ratio near 1.0 → span ≈ ref (normal day, warning is relevant)
+    # - Ratio >> 1.0 → span >> ref (V-shape day, warning less relevant)
+    # Threshold: if any day has span/ref < 0.5 (i.e., span < 50% of ref_price),
+    # the spread is not extreme enough to suppress the warning.
+    if enable_relaxation and prices_by_day:
+        base_flex = abs(config.flex)
+        if base_flex >= FLEX_WARNING_THRESHOLD_RELAXATION:
+            # Check whether any available day is "normal enough" to make the warning relevant
+            any_normal_day = False
+            for day_prices in prices_by_day.values():
+                prices = [float(p["total"]) for p in day_prices if p.get("total") is not None]
+                if len(prices) >= 2:
+                    day_min = min(prices)
+                    day_avg = sum(prices) / len(prices)
+                    span = abs(day_avg - day_min)
+                    if day_min > 0 and span / day_min < FLEX_WARNING_VSHAPE_RATIO:
+                        any_normal_day = True
+                        break
+
+            if any_normal_day:
+                if base_flex >= FLEX_HIGH_THRESHOLD_RELAXATION:
+                    _LOGGER.warning(
+                        "Base flex %.0f%% is too high for relaxation mode. "
+                        "Relaxation escalates in 3%% steps from your base - starting at %.0f%% "
+                        "means only ~%.0f steps remain before the 50%% hard limit. "
+                        "Recommendation: Use 15-20%% base flex with relaxation enabled.",
+                        base_flex * 100,
+                        base_flex * 100,
+                        (MAX_FLEX_HARD_LIMIT - base_flex) / 0.03,
+                    )
+                else:
+                    _LOGGER.info(
+                        "Base flex %.0f%% is high for relaxation mode (recommended: 15-20%%). "
+                        "Only ~%.0f relaxation steps remain to 50%% hard limit.",
+                        base_flex * 100,
+                        (MAX_FLEX_HARD_LIMIT - base_flex) / 0.03,
+                    )
+
+    _LOGGER.info(
+        "Calculating baseline periods for %d days...",
+        total_days,
+    )
+    _LOGGER_DETAILS.debug(
+        "%sProcessing ALL %d price intervals together (yesterday+today+tomorrow, allows midnight crossing)",
+        INDENT_L1,
+        len(all_prices),
+    )
+
+    # === BASELINE CALCULATION (process ALL prices together, including yesterday) ===
+    # Periods that ended before yesterday will be filtered out later by filter_periods_by_end_date()
+    # This keeps yesterday/today/tomorrow periods in the cache
+    baseline_result = calculate_periods(
+        all_prices, config=config, time=time, day_patterns_by_date=day_patterns_by_date, time_range=time_range
+    )
+    all_periods = baseline_result["periods"]
+
+    # Count periods per day for min_periods check
+    periods_by_day = group_periods_by_day(all_periods)
+    # Pre-compute per-day effective min_periods (adaptive for flat days)
+    # On flat price days (low CV), 1 period is sufficient - enforcing min_periods > 1
+    # would only produce artificial additional periods of no practical value.
+    # NOTE: Only applied for best price (reverse_sort=False); peak price always uses
+    # full relaxation to properly identify the genuinely most expensive window.
+    day_effective_min, flat_days_count = _compute_day_effective_min(
+        prices_by_day, min_periods, enable_relaxation=enable_relaxation, reverse_sort=config.reverse_sort
+    )
+
+    days_meeting_requirement = 0
+
+    for day in sorted(prices_by_day.keys()):
+        day_periods = periods_by_day.get(day, [])
+        period_count = len(day_periods)
+        effective_min = day_effective_min.get(day, min_periods)
+
+        _LOGGER_DETAILS.debug(
+            "%sDay %s baseline: Found %d periods%s",
+            INDENT_L1,
+            day,
+            period_count,
+            f" (need {effective_min})" if enable_relaxation else "",
+        )
+
+        if period_count >= effective_min:
+            days_meeting_requirement += 1
+
+    # Check if relaxation is needed
+    relaxation_was_needed = False
+    all_phases_used: list[str] = []
+
+    if enable_relaxation and days_meeting_requirement < total_days:
+        # At least one day doesn't have enough periods
+        _LOGGER_DETAILS.debug(
+            "%sBaseline insufficient (%d/%d days met target) - starting relaxation",
+            INDENT_L1,
+            days_meeting_requirement,
+            total_days,
+        )
+        relaxation_was_needed = True
+
+        # Run relaxation on ALL prices together (including yesterday)
+        relaxed_result, relax_metadata = relax_all_prices(
+            all_prices=all_prices,
+            config=config,
+            min_periods=min_periods,
+            max_relaxation_attempts=max_relaxation_attempts,
+            should_show_callback=should_show_callback,
+            baseline_periods=all_periods,
+            time=time,
+            config_entry=config_entry,
+            day_patterns_by_date=day_patterns_by_date,
+        )
+
+        all_periods = relaxed_result["periods"]
+        if relax_metadata.get("phases_used"):
+            all_phases_used = relax_metadata["phases_used"]
+
+        # Recount after relaxation
+        periods_by_day = group_periods_by_day(all_periods)
+        days_meeting_requirement = 0
+        for day in sorted(prices_by_day.keys()):
+            day_periods = periods_by_day.get(day, [])
+            period_count = len(day_periods)
+            if period_count >= day_effective_min.get(day, min_periods):
+                days_meeting_requirement += 1
+
+        # === MIN DURATION FALLBACK ===
+        # If still no periods after relaxation, try reducing min_period_length
+        # This is a last resort to ensure users always get SOME period
+        if days_meeting_requirement < total_days and config.min_period_length > MIN_DURATION_FALLBACK_MINIMUM:
+            _LOGGER.info(
+                "Relaxation incomplete (%d/%d days). Trying min_duration fallback...",
+                days_meeting_requirement,
+                total_days,
+            )
+
+            fallback_result, fallback_metadata = _try_min_duration_fallback(
+                config=config,
+                existing_periods=all_periods,
+                all_prices=all_prices,
+                prices_by_day=prices_by_day,
+                time=time,
+                max_relaxation_attempts=max_relaxation_attempts,
+                day_patterns_by_date=day_patterns_by_date,
+            )
+
+            if fallback_result:
+                all_periods = fallback_result["periods"]
+                all_phases_used.extend(fallback_metadata.get("phases_used", []))
+
+                # Recount after fallback
+                periods_by_day = group_periods_by_day(all_periods)
+                days_meeting_requirement = 0
+                for day in sorted(prices_by_day.keys()):
+                    day_periods = periods_by_day.get(day, [])
+                    period_count = len(day_periods)
+                    if period_count >= day_effective_min.get(day, min_periods):
+                        days_meeting_requirement += 1
+
+    elif enable_relaxation:
+        filter_combination_count = 2 if config.level_filter not in (None, "any") else 1
+        _LOGGER_DETAILS.debug(
+            "%sRelaxation strategy: 3%% fixed flex increment per step (%d flex levels x %d filter combinations)",
+            INDENT_L1,
+            total_days,
+            filter_combination_count,
+        )
+
+    # Sort periods by start time
+    all_periods.sort(key=lambda p: p["start"])
+
+    # Recalculate metadata for combined periods
+    recalculate_period_metadata(all_periods, time=time)
+
+    # Apply cross-day supersession filter (only for best-price periods)
+    # This removes late-night today periods that are superseded by better tomorrow alternatives
+    all_periods = filter_superseded_periods(
+        all_periods,
+        time=time,
+        reverse_sort=config.reverse_sort,
+    )
+
+    # Build final result
+    final_result = baseline_result.copy()
+    final_result["periods"] = all_periods
+
+    # Add relaxation info to metadata
+    if "metadata" not in final_result:
+        final_result["metadata"] = {}
+    final_result["metadata"]["relaxation"] = {
+        "relaxation_active": relaxation_was_needed,
+        "relaxation_attempted": relaxation_was_needed,
+        "min_periods_requested": min_periods,
+        "phases_used": list(set(all_phases_used)),  # Unique phases used across all days
+        "days_processed": total_days,
+        "days_meeting_requirement": days_meeting_requirement,
+        "relaxation_incomplete": days_meeting_requirement < total_days,
+        "flat_days_detected": flat_days_count,  # Days where adaptive min_periods (CV-based) reduced target to 1
+    }
+
+    return final_result
+
+
+def relax_all_prices(
+    all_prices: list[dict],
+    config: TibberPricesPeriodConfig,
+    min_periods: int,
+    max_relaxation_attempts: int,
+    should_show_callback: Callable[[str | None], bool],
+    baseline_periods: list[dict],
+    *,
+    time: TibberPricesTimeService,
+    config_entry: Any,  # ConfigEntry type
+    day_patterns_by_date: dict | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """
+    Relax filters for all prices until min_periods per day is reached.
+
+    Strategy: Try increasing flex by 3% increments while keeping the configured
+    level filter. For each flex level, optionally retry with `level_filter="any"`
+    when a concrete level filter is configured. Processes all prices together
+    (yesterday+today+tomorrow), allowing periods to cross midnight boundaries.
+    Returns when ALL days have min_periods (or max attempts exhausted).
+
+    Args:
+        all_prices: All price intervals (yesterday+today+tomorrow).
+        config: Base period configuration.
+        min_periods: Target number of periods PER DAY.
+        max_relaxation_attempts: Maximum flex levels to try.
+        should_show_callback: Callback to check if a flex level should be shown.
+        baseline_periods: Baseline periods (before relaxation).
+        time: TibberPricesTimeService instance.
+        config_entry: Config entry to get display unit configuration.
+        day_patterns_by_date: Optional dict mapping date → day pattern dict. Used for
+            geometric flex bonus in period detection. Passed through to calculate_periods().
+
+    Returns:
+        Tuple of (result_dict, metadata_dict)
+
+    """
+    # Import here to avoid circular dependency
+    from .core import calculate_periods  # noqa: PLC0415
+
+    flex_increment = RELAXATION_FLEX_INCREMENT  # 3% per step (see types.py for rationale)
+    base_flex = abs(config.flex)
+    original_level_filter = config.level_filter
+    existing_periods = list(baseline_periods)  # Start with baseline
+    phases_used = []
+
+    filter_variants: list[tuple[str | None, str | None]] = [(None, original_level_filter)]
+    if original_level_filter not in (None, "any"):
+        filter_variants.append(("any", "any"))
+
+    # Get available days from prices for checking
+    prices_by_day = group_prices_by_day(all_prices, time=time)
+    total_days = len(prices_by_day)
+
+    # Try flex levels (3% increments)
+    attempts = max(1, int(max_relaxation_attempts))
+    for attempt in range(1, attempts + 1):
+        current_flex = base_flex + (attempt * flex_increment)
+
+        # Stop if we exceed hard maximum
+        if current_flex > MAX_FLEX_HARD_LIMIT:
+            _LOGGER_DETAILS.debug(
+                "%s    Reached 50%% flex hard limit",
+                INDENT_L2,
+            )
+            break
+
+        for level_override, applied_level_filter in filter_variants:
+            phase_label = f"flex={current_flex * 100:.1f}%"
+            phase_label_full = phase_label
+            if applied_level_filter is not None:
+                phase_label_full = f"{phase_label} +level_{applied_level_filter}"
+
+            # The callback expects a level override (e.g. None or "any"), not a flex label.
+            if not should_show_callback(level_override):
+                continue
+
+            if level_override == "any" and original_level_filter not in (None, "any"):
+                _LOGGER_DETAILS.debug(
+                    "%s    Flex=%.1f%%: OVERRIDING level_filter: %s → ANY",
+                    INDENT_L2,
+                    current_flex * 100,
+                    original_level_filter,
+                )
+
+            # NOTE: config.flex is already normalized to positive by get_period_config()
+            relaxed_config = config._replace(
+                flex=current_flex,  # Already positive from normalization
+                level_filter=applied_level_filter,
+            )
+
+            _LOGGER_DETAILS.debug(
+                "%s    Trying %s: config has %d intervals (all days together), level_filter=%s",
+                INDENT_L2,
+                phase_label_full,
+                len(all_prices),
+                relaxed_config.level_filter,
+            )
+
+            # Process ALL prices together (allows midnight crossing)
+            result = calculate_periods(
+                all_prices,
+                config=relaxed_config,
+                time=time,
+                day_patterns_by_date=day_patterns_by_date,
+            )
+            new_periods = result["periods"]
+
+            _LOGGER_DETAILS.debug(
+                "%s    %s: calculate_periods returned %d periods",
+                INDENT_L2,
+                phase_label_full,
+                len(new_periods),
+            )
+
+            # Mark newly found periods with relaxation metadata BEFORE merging
+            mark_periods_with_relaxation(
+                new_periods,
+                relaxation_level=phase_label_full,
+                original_threshold=base_flex,
+                applied_threshold=current_flex,
+                reverse_sort=config.reverse_sort,
+            )
+
+            # Resolve overlaps between existing and new periods
+            combined, standalone_count = resolve_period_overlaps(
+                existing_periods=existing_periods,
+                new_relaxed_periods=new_periods,
+                all_prices=all_prices,
+                config=config,
+                time=time,
+            )
+
+            # Count periods per day with QUALITY GATE check
+            # Only periods with CV <= PERIOD_MAX_CV count towards min_periods requirement
+            days_meeting_requirement, quality_period_count = _count_quality_periods(
+                combined, all_prices, prices_by_day, min_periods, time=time
+            )
+
+            total_periods = len(combined)
+            _LOGGER_DETAILS.debug(
+                "%s    %s: found %d periods total, %d/%d days meet requirement",
+                INDENT_L2,
+                phase_label_full,
+                total_periods,
+                days_meeting_requirement,
+                total_days,
+            )
+
+            existing_periods = combined
+            phases_used.append(phase_label_full)
+
+            # Check if ALL days reached target
+            if days_meeting_requirement >= total_days:
+                _LOGGER.info(
+                    "Success with %s - all %d days have %d+ periods (%d total)",
+                    phase_label_full,
+                    total_days,
+                    min_periods,
+                    total_periods,
+                )
+                break
+
+        if days_meeting_requirement >= total_days:
+            break
+
+    # Build final result
+    final_result = (
+        result.copy() if "result" in locals() else {"periods": baseline_periods, "metadata": {}, "reference_data": {}}
+    )
+    final_result["periods"] = existing_periods
+
+    return final_result, {
+        "phases_used": phases_used,
+    }

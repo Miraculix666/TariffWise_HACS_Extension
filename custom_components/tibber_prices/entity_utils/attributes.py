@@ -1,0 +1,223 @@
+"""Common attribute utilities for Tibber Prices entities."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from homeassistant.core import HomeAssistant
+
+    from ..data import TibberPricesConfigEntry  # noqa: TID252
+
+
+def add_description_attributes(
+    attributes: dict,
+    platform: str,
+    translation_key: str | None,
+    hass: HomeAssistant,
+    config_entry: TibberPricesConfigEntry,
+    *,
+    position: str = "end",
+) -> None:
+    """
+    Add description attributes from custom translations to an existing attributes dict.
+
+    The 'description' attribute is always present, but its content changes based on
+    CONF_EXTENDED_DESCRIPTIONS setting:
+    - When disabled: Uses short 'description' from translations
+    - When enabled: Uses 'long_description' from translations (falls back to short if not available)
+
+    Additionally, when CONF_EXTENDED_DESCRIPTIONS is enabled, 'usage_tips' is added as
+    a separate attribute.
+
+    This function modifies the attributes dict in-place. By default, descriptions are
+    added at the END of the dict (after all other attributes). For special cases like
+    chart_data_export, use position="before_service_data" to add descriptions before
+    service data attributes.
+
+    Args:
+        attributes: Existing attributes dict to modify (in-place)
+        platform: Platform name ("sensor" or "binary_sensor")
+        translation_key: Translation key for entity
+        hass: Home Assistant instance
+        config_entry: Config entry with options
+        position: Where to add descriptions:
+                 - "end" (default): Add at the very end
+                 - "before_service_data": Add before service data (for chart_data_export)
+
+    """
+    if not translation_key or not hass:
+        return
+
+    # Import here to avoid circular dependency
+    from ..const import (  # noqa: PLC0415, TID252
+        CONF_EXTENDED_DESCRIPTIONS,
+        DEFAULT_EXTENDED_DESCRIPTIONS,
+        get_entity_description,
+    )
+
+    language = hass.config.language or "en"
+
+    # Build description dict
+    desc_attrs: dict[str, str] = {}
+
+    extended_descriptions = config_entry.options.get(
+        CONF_EXTENDED_DESCRIPTIONS,
+        config_entry.data.get(CONF_EXTENDED_DESCRIPTIONS, DEFAULT_EXTENDED_DESCRIPTIONS),
+    )
+
+    # Choose description based on extended_descriptions setting
+    if extended_descriptions:
+        # Use long_description as description content (if available)
+        description = get_entity_description(platform, translation_key, language, "long_description")
+        if not description:
+            # Fallback to short description if long_description not available
+            description = get_entity_description(platform, translation_key, language, "description")
+    else:
+        # Use short description
+        description = get_entity_description(platform, translation_key, language, "description")
+
+    if description:
+        desc_attrs["description"] = description
+
+    # Add usage_tips as separate attribute if extended_descriptions enabled
+    if extended_descriptions:
+        usage_tips = get_entity_description(platform, translation_key, language, "usage_tips")
+        if usage_tips:
+            desc_attrs["usage_tips"] = usage_tips
+
+    # Add descriptions at appropriate position
+    if position == "end":
+        # Default: Add at the very end
+        attributes.update(desc_attrs)
+    elif position == "before_service_data":
+        # Special case: Insert before service data
+        # This is used by chart_data_export to keep our attributes before foreign data
+        # We need to rebuild the dict to maintain order
+        temp_attrs = dict(attributes)
+        attributes.clear()
+
+        # Add everything except service data
+        for key, value in temp_attrs.items():
+            if key not in ("timestamp", "error"):
+                continue
+            attributes[key] = value
+
+        # Add descriptions here (before service data)
+        attributes.update(desc_attrs)
+
+        # Add service data last
+        for key, value in temp_attrs.items():
+            if key in ("timestamp", "error"):
+                continue
+            attributes[key] = value
+
+
+async def async_add_description_attributes(
+    attributes: dict,
+    platform: str,
+    translation_key: str | None,
+    hass: HomeAssistant,
+    config_entry: TibberPricesConfigEntry,
+    *,
+    position: str = "end",
+) -> None:
+    """
+    Async version of add_description_attributes.
+
+    Adds description attributes from custom translations to an existing attributes dict.
+    Uses async translation loading (calls async_get_entity_description).
+
+    Args:
+        attributes: Existing attributes dict to modify (in-place)
+        platform: Platform name ("sensor" or "binary_sensor")
+        translation_key: Translation key for entity
+        hass: Home Assistant instance
+        config_entry: Config entry with options
+        position: Where to add descriptions ("end" or "before_service_data")
+
+    """
+    if not translation_key or not hass:
+        return
+
+    # Import here to avoid circular dependency
+    from ..const import (  # noqa: PLC0415, TID252
+        CONF_EXTENDED_DESCRIPTIONS,
+        DEFAULT_EXTENDED_DESCRIPTIONS,
+        async_get_entity_description,
+    )
+
+    language = hass.config.language or "en"
+
+    # Build description dict
+    desc_attrs: dict[str, str] = {}
+
+    extended_descriptions = config_entry.options.get(
+        CONF_EXTENDED_DESCRIPTIONS,
+        config_entry.data.get(CONF_EXTENDED_DESCRIPTIONS, DEFAULT_EXTENDED_DESCRIPTIONS),
+    )
+
+    # Choose description based on extended_descriptions setting
+    if extended_descriptions:
+        # Use long_description as description content (if available)
+        description = await async_get_entity_description(
+            hass,
+            platform,
+            translation_key,
+            language,
+            "long_description",
+        )
+        if not description:
+            # Fallback to short description if long_description not available
+            description = await async_get_entity_description(
+                hass,
+                platform,
+                translation_key,
+                language,
+                "description",
+            )
+    else:
+        # Use short description
+        description = await async_get_entity_description(
+            hass,
+            platform,
+            translation_key,
+            language,
+            "description",
+        )
+
+    if description:
+        desc_attrs["description"] = description
+
+    # Add usage_tips as separate attribute if extended_descriptions enabled
+    if extended_descriptions:
+        usage_tips = await async_get_entity_description(
+            hass,
+            platform,
+            translation_key,
+            language,
+            "usage_tips",
+        )
+        if usage_tips:
+            desc_attrs["usage_tips"] = usage_tips
+
+    # Add descriptions at appropriate position
+    if position == "end":
+        # Default: Add at the very end
+        attributes.update(desc_attrs)
+    elif position == "before_service_data":
+        # Special case: Insert before service data (same logic as sync version)
+        temp_attrs = dict(attributes)
+        attributes.clear()
+
+        for key, value in temp_attrs.items():
+            if key not in ("timestamp", "error"):
+                continue
+            attributes[key] = value
+
+        attributes.update(desc_attrs)
+
+        for key, value in temp_attrs.items():
+            if key in ("timestamp", "error"):
+                continue
+            attributes[key] = value
