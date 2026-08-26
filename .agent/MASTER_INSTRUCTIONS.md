@@ -56,8 +56,8 @@ Das Repository `agents_and_prompts` beinhaltet AUSSCHLIESSLICH die systemweiten 
 
 ### 3. Repo-Namensschema & DomÃ¤nen
 - **LLM Stack**: `llm_stack_core`, `llm_stack_config`, `llm_stack_backup`
-- **Home Assistant**: `ha_core`, `ha_config`, `ha_backup_full`, `ha_backup_slim`, `ha_addons_ext`
-- **Infrastructure**: `homelab_infra`, `homelab_config`, `proxmox_host_backup`
+- **Home Assistant**: `ha_core`, `ha_config`, `ha_backup_full`, `ha_backup`, `ha_extensions`
+- **Infrastructure**: `homelab_infra`, `homelab_config`, `homelab_backup`
 - **Agents & Prompts**: `agents_and_prompts`
 
 ### 4. Anweisung
